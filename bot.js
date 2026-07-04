@@ -203,6 +203,12 @@ const CONFIG = {
     roleId: process.env.VERIFIED_ROLE_ID || null,
     minAccountAgeDays: 7, // Kick accounts younger than this
   },
+
+  // ── Temp Voice Channels ────────────────────────────────────
+  tempVoice: {
+    hubChannelId: process.env.TEMP_VOICE_HUB_ID || null,
+    categoryId: process.env.TEMP_VOICE_CATEGORY_ID || null,
+  },
 };
 
 // ============================================================
@@ -300,6 +306,12 @@ function loadGiveaways(client) {
     console.log(`[DB]  ${n} giveaway(s) restored.`);
   } catch (e) { console.error('[ERR] loadGiveaways:', e.message); }
 }
+
+// ============================================================
+//  TEMP VOICE CHANNELS STATE
+// ============================================================
+// Structure: Map<channelId, ownerId>
+const tempVoiceChannels = new Map();
 
 // ============================================================
 //  TICKET PERSISTENCE
@@ -1533,6 +1545,53 @@ const commands = [
   },
 
   // ══════════════════════════════════════════════════════════
+  //  TEMP VOICE CHANNELS
+  // ══════════════════════════════════════════════════════════
+  {
+    data: new SlashCommandBuilder()
+      .setName('voice')
+      .setDescription('Manage your temporary voice channel')
+      .addSubcommand(s => s.setName('lock').setDescription('Lock your channel (prevent others from joining)'))
+      .addSubcommand(s => s.setName('unlock').setDescription('Unlock your channel'))
+      .addSubcommand(s => s.setName('limit').setDescription('Set a user limit').addIntegerOption(o => o.setName('amount').setDescription('Max users (0 for unlimited)').setMinValue(0).setMaxValue(99).setRequired(true)))
+      .addSubcommand(s => s.setName('rename').setDescription('Rename your channel').addStringOption(o => o.setName('name').setDescription('New name').setRequired(true))),
+    async execute(interaction) {
+      const channel = interaction.member.voice.channel;
+      if (!channel) return interaction.reply({ content: '❌ You are not in a voice channel.', flags: 64 });
+
+      const ownerId = tempVoiceChannels.get(channel.id);
+      if (!ownerId) return interaction.reply({ content: '❌ This is not a temporary voice channel.', flags: 64 });
+      if (ownerId !== interaction.user.id && !interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
+        return interaction.reply({ content: '❌ Only the channel owner can manage this channel.', flags: 64 });
+      }
+
+      const sub = interaction.options.getSubcommand();
+
+      if (sub === 'lock') {
+        await channel.permissionOverwrites.edit(interaction.guild.roles.everyone, { Connect: false });
+        return interaction.reply({ content: '🔒 Your channel has been locked.', flags: 64 });
+      }
+
+      if (sub === 'unlock') {
+        await channel.permissionOverwrites.edit(interaction.guild.roles.everyone, { Connect: null });
+        return interaction.reply({ content: '🔓 Your channel has been unlocked.', flags: 64 });
+      }
+
+      if (sub === 'limit') {
+        const amount = interaction.options.getInteger('amount');
+        await channel.setUserLimit(amount);
+        return interaction.reply({ content: `👥 Channel user limit set to **${amount === 0 ? 'Unlimited' : amount}**.`, flags: 64 });
+      }
+
+      if (sub === 'rename') {
+        const newName = interaction.options.getString('name');
+        await channel.setName(newName);
+        return interaction.reply({ content: `📝 Channel renamed to **${newName}**.`, flags: 64 });
+      }
+    },
+  },
+
+  // ══════════════════════════════════════════════════════════
   //  ANTI-RAID / CAPTCHA VERIFICATION
   // ══════════════════════════════════════════════════════════
   {
@@ -2416,6 +2475,53 @@ client.once('clientReady', async () => {
 });
 
 // ============================================================
+//  VOICE STATE UPDATE (FOR TEMP CHANNELS)
+// ============================================================
+client.on('voiceStateUpdate', async (oldState, newState) => {
+  const { hubChannelId, categoryId } = CONFIG.tempVoice;
+  if (!hubChannelId) return; // Feature disabled
+
+  // User joined the Hub channel
+  if (newState.channelId === hubChannelId) {
+    try {
+      const parentId = categoryId || newState.channel?.parentId || undefined;
+      const newChannel = await newState.guild.channels.create({
+        name: `${newState.member.user.username}'s Channel`,
+        type: ChannelType.GuildVoice,
+        parent: parentId,
+        permissionOverwrites: [
+          {
+            id: newState.member.user.id,
+            allow: [PermissionFlagsBits.ManageChannels, PermissionFlagsBits.ManageRoles]
+          }
+        ]
+      });
+
+      tempVoiceChannels.set(newChannel.id, newState.member.user.id);
+      await newState.setChannel(newChannel);
+    } catch (e) {
+      console.error('[ERR] Failed to create temp voice channel:', e.message);
+    }
+  }
+
+  // User left a channel
+  if (oldState.channelId && oldState.channelId !== newState.channelId) {
+    if (tempVoiceChannels.has(oldState.channelId)) {
+      const channel = oldState.channel;
+      // If the channel is now empty, delete it
+      if (channel && channel.members.size === 0) {
+        try {
+          await channel.delete('Temp voice channel empty');
+          tempVoiceChannels.delete(oldState.channelId);
+        } catch (e) {
+          console.error('[ERR] Failed to delete temp voice channel:', e.message);
+        }
+      }
+    }
+  }
+});
+
+// ============================================================
 //  MEMBER JOIN/LEAVE LOGGING
 // ============================================================
 const { Welcome, Leave } = require('canvafy');
@@ -2907,6 +3013,7 @@ app.get('/api/config', (req, res) => {
     fivemServer: CONFIG.fivemServer,
     welcome: CONFIG.welcome,
     verification: CONFIG.verification,
+    tempVoice: CONFIG.tempVoice,
   });
 });
 
@@ -3177,7 +3284,9 @@ app.get('/', (req, res) => {
         'moderation.maxWarnings': 'Max Warnings (before kick)',
         'economy.dailyReward': 'Economy: Daily Reward Coins',
         'verification.roleId': 'Verification Role ID',
-        'verification.minAccountAgeDays': 'Anti-Raid Min Account Age (Days)'
+        'verification.minAccountAgeDays': 'Anti-Raid Min Account Age (Days)',
+        'tempVoice.hubChannelId': 'Temp Voice Hub Channel ID',
+        'tempVoice.categoryId': 'Temp Voice Category ID'
       };
 
       let formHtml = '';
@@ -3487,6 +3596,28 @@ client.on('messageCreate', async message => {
     try { await member.timeout(CONFIG.timeoutDurationMinutes * 60_000, 'Unauthorised link'); timedOut = true; } catch {}
     try { await message.author.send(`⚠️ Links not allowed in **${message.guild.name}**.${timedOut ? ` Timed out for ${CONFIG.timeoutDurationMinutes} min.` : ''}`); } catch {}
     await sendLog(message.guild, new EmbedBuilder().setTitle('🔗 Unauthorised Link').setColor(0xE67E22).addFields({ name: '👤 User', value: `${message.author} (${message.author.tag})`, inline: true }, { name: '📌 Channel', value: `${message.channel}`, inline: true }, { name: 'Message', value: content.slice(0, 1024) }, { name: '⏱️ Timeout', value: timedOut ? `${CONFIG.timeoutDurationMinutes} min` : 'No', inline: true }).setTimestamp().setFooter({ text: 'Link Guard' }));
+    return;
+  }
+
+  // Auto-Moderation: Spam / Toxicity detection
+  if (!hasWordFilterExempt(member)) {
+    // Check for excessive caps (if message is > 10 chars and > 70% caps)
+    const letters = content.replace(/[^a-zA-Z]/g, '');
+    if (letters.length > 10) {
+      const upperCount = (letters.match(/[A-Z]/g) || []).length;
+      if (upperCount / letters.length > 0.7) {
+        try { await message.delete(); } catch {}
+        try { await message.author.send(`⚠️ Please turn off CAPS LOCK in **${message.guild.name}**.`); } catch {}
+        return;
+      }
+    }
+
+    // Check for massive repeated characters (spam)
+    if (/(.)\1{9,}/.test(content)) {
+      try { await message.delete(); } catch {}
+      try { await message.author.send(`⚠️ Please do not spam repeated characters in **${message.guild.name}**.`); } catch {}
+      return;
+    }
   }
 });
 
