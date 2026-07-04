@@ -34,6 +34,8 @@ const DEPS = [
   'axios',            // HTTP requests for KeyAuth API
   'dotenv',           // Load environment variables from .env
   'express',          // HTTP API server for license verification
+  'canvafy',          // Welcome/Goodbye images
+  'gamedig',          // FiveM server status
 ];
 
 function isInstalled(pkg) {
@@ -168,6 +170,30 @@ const CONFIG = {
     clientSecret: process.env.CLIENT_SECRET || process.env.DISCORD_CLIENT_SECRET || '',
     redirectUri:  process.env.DISCORD_OAUTH_REDIRECT_URI || 'http://localhost:3000/api/auth/callback',
   },
+
+  // ── Economy ────────────────────────────────────────────────
+  economy: {
+    dailyReward: 500,
+    xpPerMessage: { min: 5, max: 15 },
+    xpCooldownMs: 60000,
+  },
+
+  // ── FiveM Server ───────────────────────────────────────────
+  fivemServer: {
+    ip: process.env.FIVEM_IP || '127.0.0.1',
+    port: process.env.FIVEM_PORT || '30120',
+  },
+
+  // ── Welcome/Goodbye ────────────────────────────────────────
+  welcome: {
+    channelId: process.env.WELCOME_CHANNEL_ID || null,
+    backgroundUrl: process.env.WELCOME_BG_URL || 'https://i.imgur.com/4mXtF9Z.png',
+  },
+
+  // ── Moderation ─────────────────────────────────────────────
+  moderation: {
+    maxWarnings: 3, // Auto-action after this many warnings
+  },
 };
 
 // ============================================================
@@ -182,6 +208,8 @@ const TICKETS_FILE    = path.join(DATA_DIR, 'tickets.json');
 const BLACKLIST_FILE  = path.join(DATA_DIR, 'blacklist.json');
 const KEYAUTH_FILE    = path.join(DATA_DIR, 'keyauth_redemptions.json');
 const VERIFICATIONS_FILE = path.join(DATA_DIR, 'verifications.json');
+const WARNINGS_FILE   = path.join(DATA_DIR, 'warnings.json');
+const ECONOMY_FILE    = path.join(DATA_DIR, 'economy.json');
 const POOL_FILES      = {
   steam:   path.join(ACCOUNTS_DIR, 'steam.txt'),
   discord: path.join(ACCOUNTS_DIR, 'discord.txt'),
@@ -354,6 +382,50 @@ function loadVerifications() {
     saveVerifications();
     console.log(`[DB]  ${verificationCodes.size} verification code(s) loaded.`);
   } catch (e) { console.error('[ERR] loadVerifications:', e.message); }
+}
+
+// ============================================================
+//  WARNINGS PERSISTENCE
+// ============================================================
+// Structure: Map<userId, [ { reason, adminTag, timestamp } ]>
+const warningsMap = new Map();
+
+function saveWarnings() {
+  const data = {};
+  for (const [k, v] of warningsMap) data[k] = v;
+  fs.writeFileSync(WARNINGS_FILE, JSON.stringify(data, null, 2), 'utf8');
+}
+
+function loadWarnings() {
+  if (!fs.existsSync(WARNINGS_FILE)) return;
+  try {
+    const data = JSON.parse(fs.readFileSync(WARNINGS_FILE, 'utf8'));
+    for (const [k, v] of Object.entries(data)) warningsMap.set(k, v);
+    let count = 0;
+    for (const v of warningsMap.values()) count += v.length;
+    console.log(`[DB]  ${count} warning(s) restored across ${warningsMap.size} user(s).`);
+  } catch (e) { console.error('[ERR] loadWarnings:', e.message); }
+}
+
+// ============================================================
+//  ECONOMY PERSISTENCE
+// ============================================================
+// Structure: Map<userId, { balance, xp, level, lastXp, lastDaily }>
+const economyMap = new Map();
+
+function saveEconomy() {
+  const data = {};
+  for (const [k, v] of economyMap) data[k] = v;
+  fs.writeFileSync(ECONOMY_FILE, JSON.stringify(data, null, 2), 'utf8');
+}
+
+function loadEconomy() {
+  if (!fs.existsSync(ECONOMY_FILE)) return;
+  try {
+    const data = JSON.parse(fs.readFileSync(ECONOMY_FILE, 'utf8'));
+    for (const [k, v] of Object.entries(data)) economyMap.set(k, v);
+    console.log(`[DB]  ${economyMap.size} economy profile(s) restored.`);
+  } catch (e) { console.error('[ERR] loadEconomy:', e.message); }
 }
 
 // Generate random 8-character verification code
@@ -1452,6 +1524,399 @@ const commands = [
   },
 
   // ══════════════════════════════════════════════════════════
+  //  ECONOMY & LEVELING
+  // ══════════════════════════════════════════════════════════
+  {
+    data: new SlashCommandBuilder()
+      .setName('rank')
+      .setDescription('Check your or another user\'s level and XP')
+      .addUserOption(o => o.setName('user').setDescription('User to check').setRequired(false)),
+    async execute(interaction) {
+      const target = interaction.options.getUser('user') || interaction.user;
+      if (target.bot) return interaction.reply({ content: '❌ Bots do not have ranks.', flags: 64 });
+
+      const profile = economyMap.get(target.id) || { balance: 0, xp: 0, level: 0, lastXp: 0, lastDaily: 0 };
+      const nextLevelXp = (profile.level + 1) * 100;
+
+      await interaction.reply({
+        embeds: [new EmbedBuilder().setColor(0x57F287).setTitle(`${EMOJI.star} ${target.username}'s Rank`)
+          .setThumbnail(target.displayAvatarURL({ size: 256 }))
+          .addFields(
+            { name: 'Level', value: `\`${profile.level}\``, inline: true },
+            { name: 'XP', value: `\`${profile.xp} / ${nextLevelXp}\``, inline: true },
+          )],
+      });
+    },
+  },
+
+  {
+    data: new SlashCommandBuilder()
+      .setName('balance')
+      .setDescription('Check your coin balance')
+      .addUserOption(o => o.setName('user').setDescription('User to check').setRequired(false)),
+    async execute(interaction) {
+      const target = interaction.options.getUser('user') || interaction.user;
+      if (target.bot) return interaction.reply({ content: '❌ Bots do not have a balance.', flags: 64 });
+
+      const profile = economyMap.get(target.id) || { balance: 0, xp: 0, level: 0, lastXp: 0, lastDaily: 0 };
+
+      await interaction.reply({
+        embeds: [new EmbedBuilder().setColor(0xF1C40F).setTitle(`💰 ${target.username}'s Balance`)
+          .setDescription(`**Balance:** ${profile.balance} coins`)],
+      });
+    },
+  },
+
+  {
+    data: new SlashCommandBuilder()
+      .setName('daily')
+      .setDescription('Claim your daily coins'),
+    async execute(interaction) {
+      const profile = economyMap.get(interaction.user.id) || { balance: 0, xp: 0, level: 0, lastXp: 0, lastDaily: 0 };
+      const now = Date.now();
+      const oneDay = 24 * 60 * 60 * 1000;
+
+      if (now - profile.lastDaily < oneDay) {
+        const remaining = profile.lastDaily + oneDay - now;
+        const hours = Math.floor(remaining / (1000 * 60 * 60));
+        const minutes = Math.floor((remaining % (1000 * 60 * 60)) / (1000 * 60));
+        return interaction.reply({ content: `⏱️ You already claimed your daily reward! Try again in **${hours}h ${minutes}m**.`, flags: 64 });
+      }
+
+      profile.balance += CONFIG.economy.dailyReward;
+      profile.lastDaily = now;
+      economyMap.set(interaction.user.id, profile);
+      saveEconomy();
+
+      await interaction.reply({ content: `✅ You claimed your daily reward of **${CONFIG.economy.dailyReward} coins**! Your new balance is **${profile.balance} coins**.`, flags: 64 });
+    },
+  },
+
+  {
+    data: new SlashCommandBuilder()
+      .setName('addmoney')
+      .setDescription('Add money to a user')
+      .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
+      .addIntegerOption(o => o.setName('amount').setDescription('Amount').setRequired(true))
+      .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+    async execute(interaction) {
+      if (!hasCommandPerm(interaction.member)) return interaction.reply({ content: '❌ No permission.', flags: 64 });
+      const target = interaction.options.getUser('user');
+      const amount = interaction.options.getInteger('amount');
+
+      const profile = economyMap.get(target.id) || { balance: 0, xp: 0, level: 0, lastXp: 0, lastDaily: 0 };
+      profile.balance += amount;
+      economyMap.set(target.id, profile);
+      saveEconomy();
+
+      await interaction.reply({ content: `✅ Added **${amount} coins** to ${target.tag}. New balance: **${profile.balance} coins**.`, flags: 64 });
+    },
+  },
+
+  {
+    data: new SlashCommandBuilder()
+      .setName('removemoney')
+      .setDescription('Remove money from a user')
+      .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
+      .addIntegerOption(o => o.setName('amount').setDescription('Amount').setRequired(true))
+      .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+    async execute(interaction) {
+      if (!hasCommandPerm(interaction.member)) return interaction.reply({ content: '❌ No permission.', flags: 64 });
+      const target = interaction.options.getUser('user');
+      const amount = interaction.options.getInteger('amount');
+
+      const profile = economyMap.get(target.id) || { balance: 0, xp: 0, level: 0, lastXp: 0, lastDaily: 0 };
+      profile.balance = Math.max(0, profile.balance - amount);
+      economyMap.set(target.id, profile);
+      saveEconomy();
+
+      await interaction.reply({ content: `✅ Removed **${amount} coins** from ${target.tag}. New balance: **${profile.balance} coins**.`, flags: 64 });
+    },
+  },
+
+  {
+    data: new SlashCommandBuilder()
+      .setName('coinflip')
+      .setDescription('Gamble your coins in a coinflip')
+      .addIntegerOption(o => o.setName('amount').setDescription('Amount to bet').setRequired(true))
+      .addStringOption(o => o.setName('choice').setDescription('Heads or Tails').setRequired(true).addChoices({ name: 'Heads', value: 'heads' }, { name: 'Tails', value: 'tails' })),
+    async execute(interaction) {
+      const amount = interaction.options.getInteger('amount');
+      const choice = interaction.options.getString('choice');
+      if (amount <= 0) return interaction.reply({ content: '❌ Bet must be greater than 0.', flags: 64 });
+
+      const profile = economyMap.get(interaction.user.id) || { balance: 0, xp: 0, level: 0, lastXp: 0, lastDaily: 0 };
+      if (profile.balance < amount) return interaction.reply({ content: `❌ You only have **${profile.balance} coins**.`, flags: 64 });
+
+      const outcome = Math.random() < 0.5 ? 'heads' : 'tails';
+      if (outcome === choice) {
+        profile.balance += amount;
+        await interaction.reply(`🎉 You guessed **${choice}** and won **${amount} coins**! New balance: **${profile.balance} coins**.`);
+      } else {
+        profile.balance -= amount;
+        await interaction.reply(`😔 It was **${outcome}**. You lost **${amount} coins**. New balance: **${profile.balance} coins**.`);
+      }
+      economyMap.set(interaction.user.id, profile);
+      saveEconomy();
+    },
+  },
+
+  {
+    data: new SlashCommandBuilder()
+      .setName('shop')
+      .setDescription('View the shop'),
+    async execute(interaction) {
+      if (!CONFIG.economy.shopItems.length) return interaction.reply({ content: '❌ The shop is empty.', flags: 64 });
+
+      const desc = CONFIG.economy.shopItems.map(item => `**ID:** \`${item.id}\` | **${item.name}**\n> ${item.description}\n> **Price:** 💰 ${item.price} coins`).join('\n\n');
+
+      await interaction.reply({
+        embeds: [new EmbedBuilder().setColor(0xF1C40F).setTitle('🛒 Server Shop')
+          .setDescription(desc)
+          .setFooter({ text: 'Use /buy <id> to purchase an item' })],
+      });
+    },
+  },
+
+  {
+    data: new SlashCommandBuilder()
+      .setName('buy')
+      .setDescription('Buy an item from the shop')
+      .addStringOption(o => o.setName('id').setDescription('Item ID from the shop').setRequired(true)),
+    async execute(interaction) {
+      const id = interaction.options.getString('id');
+      const item = CONFIG.economy.shopItems.find(i => i.id === id);
+      if (!item) return interaction.reply({ content: '❌ Item not found in the shop.', flags: 64 });
+
+      const profile = economyMap.get(interaction.user.id) || { balance: 0, xp: 0, level: 0, lastXp: 0, lastDaily: 0 };
+      if (profile.balance < item.price) return interaction.reply({ content: `❌ You need **${item.price} coins** to buy this. You have **${profile.balance} coins**.`, flags: 64 });
+
+      if (item.roleId) {
+        if (!interaction.guild.roles.cache.has(item.roleId)) return interaction.reply({ content: '❌ The role for this item does not exist in the server.', flags: 64 });
+        if (interaction.member.roles.cache.has(item.roleId)) return interaction.reply({ content: '❌ You already have this role.', flags: 64 });
+
+        try {
+          await interaction.member.roles.add(item.roleId, 'Bought from shop');
+        } catch (e) {
+          return interaction.reply({ content: '❌ Could not give you the role. Please check my permissions.', flags: 64 });
+        }
+
+        profile.balance -= item.price;
+        economyMap.set(interaction.user.id, profile);
+        saveEconomy();
+        return interaction.reply(`✅ You successfully bought **${item.name}** for **${item.price} coins**!`);
+      } else if (item.type) {
+        // Test DM before taking account from pool
+        try {
+          // Send an initial message to see if we can DM them
+          await interaction.user.send(`${EMOJI.pkg} Preparing your **${item.type}** account...`);
+        } catch (e) {
+          return interaction.reply({ content: '❌ Please enable your DMs to receive the account.', flags: 64 });
+        }
+
+        const acc = takeAccount(item.type);
+        if (!acc) return interaction.reply({ content: '❌ Out of stock.', flags: 64 });
+
+        try {
+          await interaction.user.send(`Here is your account:\n\`\`\`${acc}\`\`\``);
+        } catch (e) {
+          // Fallback, technically already checked but if it fails we push back
+          addAccountsToPool(item.type, [acc]);
+          return interaction.reply({ content: '❌ Something went wrong sending your DM. Account was refunded.', flags: 64 });
+        }
+
+        profile.balance -= item.price;
+        economyMap.set(interaction.user.id, profile);
+        saveEconomy();
+        return interaction.reply(`✅ You successfully bought **${item.name}** for **${item.price} coins**! Check your DMs.`);
+      }
+
+      interaction.reply({ content: '❌ Item is not configured correctly.', flags: 64 });
+    },
+  },
+
+  // ══════════════════════════════════════════════════════════
+  //  FIVEM SERVER STATUS
+  // ══════════════════════════════════════════════════════════
+  {
+    data: new SlashCommandBuilder()
+      .setName('serverstatus')
+      .setDescription('Check the FiveM server status'),
+    async execute(interaction) {
+      await interaction.deferReply();
+      const { ip, port } = CONFIG.fivemServer;
+      const baseUrl = `http://${ip}:${port}`;
+
+      try {
+        const infoRes = await axios.get(`${baseUrl}/info.json`, { timeout: 5000 });
+        const playersRes = await axios.get(`${baseUrl}/players.json`, { timeout: 5000 });
+
+        const info = infoRes.data;
+        const players = playersRes.data;
+
+        const embed = new EmbedBuilder()
+          .setColor(0x57F287)
+          .setTitle(`${EMOJI.car} FiveM Server Status`)
+          .setDescription(`**${info.vars?.sv_projectName || 'FiveM Server'}**`)
+          .addFields(
+            { name: 'Status', value: `${EMOJI.check} Online`, inline: true },
+            { name: 'Players', value: `${players.length} / ${info.vars?.sv_maxClients || 'Unknown'}`, inline: true },
+            { name: 'Connect', value: `\`connect ${ip}:${port}\``, inline: false }
+          )
+          .setFooter({ text: `Game: ${info.server?.name || 'GTA V'}` })
+          .setTimestamp();
+
+        await interaction.editReply({ embeds: [embed] });
+      } catch (e) {
+        await interaction.editReply({
+          embeds: [new EmbedBuilder()
+            .setColor(0xE74C3C)
+            .setTitle(`${EMOJI.car} FiveM Server Status`)
+            .setDescription(`**Status:** ${EMOJI.cross} Offline\n\nCould not connect to the server at \`${ip}:${port}\`.`)
+            .setTimestamp()]
+        });
+      }
+    },
+  },
+
+  // ══════════════════════════════════════════════════════════
+  //  MODERATION
+  // ══════════════════════════════════════════════════════════
+  {
+    data: new SlashCommandBuilder()
+      .setName('warn')
+      .setDescription('Warn a user')
+      .addUserOption(o => o.setName('user').setDescription('User to warn').setRequired(true))
+      .addStringOption(o => o.setName('reason').setDescription('Reason for warning').setRequired(true))
+      .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
+    async execute(interaction) {
+      if (!hasCommandPerm(interaction.member)) return interaction.reply({ content: '❌ No permission.', flags: 64 });
+      const target = interaction.options.getUser('user');
+      const reason = interaction.options.getString('reason');
+
+      if (target.id === interaction.user.id || target.bot) return interaction.reply({ content: '❌ Invalid target.', flags: 64 });
+
+      const warnings = warningsMap.get(target.id) || [];
+      warnings.push({ reason, adminTag: interaction.user.tag, timestamp: new Date().toISOString() });
+      warningsMap.set(target.id, warnings);
+      saveWarnings();
+
+      let actionText = '';
+      if (warnings.length >= CONFIG.moderation.maxWarnings) {
+        const member = await interaction.guild.members.fetch(target.id).catch(() => null);
+        if (member && member.kickable) {
+          try {
+            await member.kick(`Reached ${CONFIG.moderation.maxWarnings} warnings`);
+            actionText = `\n\n🚨 **User was automatically kicked for reaching ${CONFIG.moderation.maxWarnings} warnings.**`;
+            warningsMap.delete(target.id);
+            saveWarnings();
+          } catch (e) {
+            actionText = `\n\n⚠️ Could not kick user automatically.`;
+          }
+        }
+      }
+
+      await interaction.reply({
+        embeds: [new EmbedBuilder().setColor(0xFF9900).setTitle(`${EMOJI.warn} User Warned`)
+          .setDescription(`**${target.tag}** has been warned.\n**Reason:** ${reason}${actionText}`)
+          .setFooter({ text: `Total Warnings: ${warningsMap.has(target.id) ? warningsMap.get(target.id).length : 0}` })],
+      });
+      try { await target.send(`⚠️ You were warned in **${interaction.guild.name}** for: **${reason}**`); } catch {}
+    },
+  },
+
+  {
+    data: new SlashCommandBuilder()
+      .setName('warnings')
+      .setDescription('List warnings for a user')
+      .addUserOption(o => o.setName('user').setDescription('User to check').setRequired(true))
+      .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
+    async execute(interaction) {
+      if (!hasCommandPerm(interaction.member)) return interaction.reply({ content: '❌ No permission.', flags: 64 });
+      const target = interaction.options.getUser('user');
+      const warnings = warningsMap.get(target.id) || [];
+
+      if (!warnings.length) return interaction.reply({ content: `${EMOJI.check} **${target.tag}** has no warnings.`, flags: 64 });
+
+      const desc = warnings.map((w, i) => `**${i + 1}.** ${w.reason}\n> By: ${w.adminTag} • <t:${Math.floor(new Date(w.timestamp).getTime() / 1000)}:R>`).join('\n\n');
+      await interaction.reply({
+        embeds: [new EmbedBuilder().setColor(0xFF9900).setTitle(`${EMOJI.warn} Warnings for ${target.tag}`)
+          .setDescription(desc)],
+      });
+    },
+  },
+
+  {
+    data: new SlashCommandBuilder()
+      .setName('clearwarnings')
+      .setDescription('Clear all warnings for a user')
+      .addUserOption(o => o.setName('user').setDescription('User to clear').setRequired(true))
+      .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
+    async execute(interaction) {
+      if (!hasCommandPerm(interaction.member)) return interaction.reply({ content: '❌ No permission.', flags: 64 });
+      const target = interaction.options.getUser('user');
+      warningsMap.delete(target.id);
+      saveWarnings();
+      await interaction.reply({ content: `${EMOJI.check} Cleared all warnings for **${target.tag}**.`, flags: 64 });
+    },
+  },
+
+  {
+    data: new SlashCommandBuilder()
+      .setName('kick')
+      .setDescription('Kick a member')
+      .addUserOption(o => o.setName('user').setDescription('User to kick').setRequired(true))
+      .addStringOption(o => o.setName('reason').setDescription('Reason for kicking').setRequired(false))
+      .setDefaultMemberPermissions(PermissionFlagsBits.KickMembers),
+    async execute(interaction) {
+      if (!hasCommandPerm(interaction.member)) return interaction.reply({ content: '❌ No permission.', flags: 64 });
+      const target = interaction.options.getUser('user');
+      const reason = interaction.options.getString('reason') || 'No reason provided';
+      const member = await interaction.guild.members.fetch(target.id).catch(() => null);
+      if (!member) return interaction.reply({ content: '❌ Member not found.', flags: 64 });
+      if (!member.kickable) return interaction.reply({ content: '❌ Cannot kick this member.', flags: 64 });
+
+      try { await target.send(`🛑 You were kicked from **${interaction.guild.name}** for: **${reason}**`); } catch {}
+      await member.kick(reason);
+      await interaction.reply({ embeds: [new EmbedBuilder().setColor(0xE74C3C).setTitle(`${EMOJI.hammer} Member Kicked`).setDescription(`**${target.tag}** was kicked.\n**Reason:** ${reason}`)] });
+    },
+  },
+
+  {
+    data: new SlashCommandBuilder()
+      .setName('ban')
+      .setDescription('Ban a member')
+      .addUserOption(o => o.setName('user').setDescription('User to ban').setRequired(true))
+      .addStringOption(o => o.setName('reason').setDescription('Reason for banning').setRequired(false))
+      .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers),
+    async execute(interaction) {
+      if (!hasCommandPerm(interaction.member)) return interaction.reply({ content: '❌ No permission.', flags: 64 });
+      const target = interaction.options.getUser('user');
+      const reason = interaction.options.getString('reason') || 'No reason provided';
+
+      try { await target.send(`🔨 You were banned from **${interaction.guild.name}** for: **${reason}**`); } catch {}
+      await interaction.guild.members.ban(target, { reason }).catch(() => null);
+      await interaction.reply({ embeds: [new EmbedBuilder().setColor(0xE74C3C).setTitle(`${EMOJI.ban} Member Banned`).setDescription(`**${target.tag}** was banned.\n**Reason:** ${reason}`)] });
+    },
+  },
+
+  {
+    data: new SlashCommandBuilder()
+      .setName('purge')
+      .setDescription('Delete a specified number of messages')
+      .addIntegerOption(o => o.setName('amount').setDescription('Number of messages to delete (1-100)').setMinValue(1).setMaxValue(100).setRequired(true))
+      .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
+    async execute(interaction) {
+      if (!hasCommandPerm(interaction.member)) return interaction.reply({ content: '❌ No permission.', flags: 64 });
+      const amount = interaction.options.getInteger('amount');
+      const deleted = await interaction.channel.bulkDelete(amount, true).catch(() => null);
+      if (!deleted) return interaction.reply({ content: '❌ Failed to delete messages. Messages older than 14 days cannot be bulk deleted.', flags: 64 });
+      await interaction.reply({ content: `${EMOJI.trash} Deleted **${deleted.size}** messages.`, flags: 64 });
+      setTimeout(() => interaction.deleteReply().catch(() => {}), 3000);
+    },
+  },
+
+  // ══════════════════════════════════════════════════════════
   //  TICKETS
   // ══════════════════════════════════════════════════════════
   {
@@ -1888,6 +2353,8 @@ loadTickets();
 loadBlacklist();
 loadKeyauthRedemptions();
 loadVerifications();
+loadWarnings();
+loadEconomy();
 
 client.once('clientReady', async () => {
   await initSpotify();
@@ -1914,8 +2381,11 @@ client.once('clientReady', async () => {
 // ============================================================
 //  MEMBER JOIN/LEAVE LOGGING
 // ============================================================
+const { Welcome, Leave } = require('canvafy');
+const { AttachmentBuilder } = require('discord.js');
+
 client.on('guildMemberAdd', async member => {
-  if (!CONFIG.logChannelId) return;
+  if (!CONFIG.logChannelId && !CONFIG.welcome.channelId) return;
   try {
     const embed = new EmbedBuilder()
       .setColor(0x57F287)
@@ -1929,13 +2399,31 @@ client.on('guildMemberAdd', async member => {
       )
       .setTimestamp();
     await sendLog(member.guild, embed);
+
+    if (CONFIG.welcome.channelId) {
+      const welcomeChannel = member.guild.channels.cache.get(CONFIG.welcome.channelId);
+      if (welcomeChannel) {
+        const welcome = await new Welcome()
+          .setAvatar(member.user.displayAvatarURL({ forceStatic: true, extension: 'png' }))
+          .setBackground('image', CONFIG.welcome.backgroundUrl)
+          .setTitle('Welcome')
+          .setDescription(`Welcome to ${member.guild.name}!`)
+          .setBorder('#2a2e35')
+          .setAvatarBorder('#2a2e35')
+          .setOverlayOpacity(0.3)
+          .build();
+
+        const attachment = new AttachmentBuilder(welcome, { name: `welcome-${member.id}.png` });
+        await welcomeChannel.send({ content: `Welcome to the server, ${member}!`, files: [attachment] });
+      }
+    }
   } catch (e) {
     console.error('[ERR] guildMemberAdd:', e.message);
   }
 });
 
 client.on('guildMemberRemove', async member => {
-  if (!CONFIG.logChannelId) return;
+  if (!CONFIG.logChannelId && !CONFIG.welcome.channelId) return;
   try {
     const embed = new EmbedBuilder()
       .setColor(0xE74C3C)
@@ -1949,6 +2437,24 @@ client.on('guildMemberRemove', async member => {
       )
       .setTimestamp();
     await sendLog(member.guild, embed);
+
+    if (CONFIG.welcome.channelId) {
+      const welcomeChannel = member.guild.channels.cache.get(CONFIG.welcome.channelId);
+      if (welcomeChannel) {
+        const leave = await new Leave()
+          .setAvatar(member.user.displayAvatarURL({ forceStatic: true, extension: 'png' }))
+          .setBackground('image', CONFIG.welcome.backgroundUrl)
+          .setTitle('Goodbye')
+          .setDescription(`Sad to see you go!`)
+          .setBorder('#2a2e35')
+          .setAvatarBorder('#2a2e35')
+          .setOverlayOpacity(0.3)
+          .build();
+
+        const attachment = new AttachmentBuilder(leave, { name: `leave-${member.id}.png` });
+        await welcomeChannel.send({ content: `Goodbye, **${member.user.tag}**.`, files: [attachment] });
+      }
+    }
   } catch (e) {
     console.error('[ERR] guildMemberRemove:', e.message);
   }
@@ -2633,13 +3139,34 @@ client.on('interactionCreate', async interaction => {
 });
 
 // ============================================================
-//  MESSAGE GUARD
+//  MESSAGE GUARD & XP SYSTEM
 // ============================================================
 client.on('messageCreate', async message => {
   if (message.author.bot || !message.guild) return;
   const member = message.member;
   if (!member) return;
   const content = message.content;
+
+  // ── XP System ───────────────────────────────────────────────
+  const profile = economyMap.get(message.author.id) || { balance: 0, xp: 0, level: 0, lastXp: 0, lastDaily: 0 };
+  const now = Date.now();
+  if (now - profile.lastXp > CONFIG.economy.xpCooldownMs) {
+    const { min, max } = CONFIG.economy.xpPerMessage;
+    const xpEarned = Math.floor(Math.random() * (max - min + 1)) + min;
+    profile.xp += xpEarned;
+    profile.lastXp = now;
+
+    const nextLevelXp = (profile.level + 1) * 100;
+    if (profile.xp >= nextLevelXp) {
+      profile.xp -= nextLevelXp;
+      profile.level += 1;
+      try {
+        await message.channel.send(`${EMOJI.tada} Congratulations ${message.author}, you leveled up to **Level ${profile.level}**!`);
+      } catch (e) {}
+    }
+    economyMap.set(message.author.id, profile);
+    saveEconomy(); // Consider debouncing in a production env
+  }
 
   // Word filter
   if (!hasWordFilterExempt(member) && CONFIG.blacklistedWords.length) {
