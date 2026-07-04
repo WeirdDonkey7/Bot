@@ -176,6 +176,8 @@ const CONFIG = {
     dailyReward: 500,
     xpPerMessage: { min: 5, max: 15 },
     xpCooldownMs: 60000,
+    levelRoles: [],
+    shopItems: [],
   },
 
   // ── FiveM Server ───────────────────────────────────────────
@@ -193,6 +195,13 @@ const CONFIG = {
   // ── Moderation ─────────────────────────────────────────────
   moderation: {
     maxWarnings: 3, // Auto-action after this many warnings
+  },
+
+  // ── Verification / Anti-Raid ───────────────────────────────
+  verification: {
+    channelId: process.env.VERIFICATION_CHANNEL_ID || null,
+    roleId: process.env.VERIFIED_ROLE_ID || null,
+    minAccountAgeDays: 7, // Kick accounts younger than this
   },
 };
 
@@ -1524,6 +1533,33 @@ const commands = [
   },
 
   // ══════════════════════════════════════════════════════════
+  //  ANTI-RAID / CAPTCHA VERIFICATION
+  // ══════════════════════════════════════════════════════════
+  {
+    data: new SlashCommandBuilder()
+      .setName('verification-setup')
+      .setDescription('Set up the Captcha verification panel')
+      .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+    async execute(interaction) {
+      if (!hasCommandPerm(interaction.member)) return interaction.reply({ content: '❌ No permission.', flags: 64 });
+      if (!CONFIG.verification.roleId) return interaction.reply({ content: '❌ Please configure the verification role ID first.', flags: 64 });
+
+      const embed = new EmbedBuilder()
+        .setColor(0x5865F2)
+        .setTitle('🛡️ Server Verification')
+        .setDescription('To gain access to the rest of the server, please click the button below and solve the Captcha.')
+        .setFooter({ text: 'Anti-Raid Protection' });
+
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('start_verification').setLabel('Verify').setStyle(ButtonStyle.Success).setEmoji('🛡️')
+      );
+
+      await interaction.channel.send({ embeds: [embed], components: [row] });
+      await interaction.reply({ content: '✅ Verification panel setup complete.', flags: 64 });
+    },
+  },
+
+  // ══════════════════════════════════════════════════════════
   //  ECONOMY & LEVELING
   // ══════════════════════════════════════════════════════════
   {
@@ -1666,7 +1702,7 @@ const commands = [
       .setName('shop')
       .setDescription('View the shop'),
     async execute(interaction) {
-      if (!CONFIG.economy.shopItems.length) return interaction.reply({ content: '❌ The shop is empty.', flags: 64 });
+      if (!CONFIG.economy.shopItems || !CONFIG.economy.shopItems.length) return interaction.reply({ content: '❌ The shop is empty.', flags: 64 });
 
       const desc = CONFIG.economy.shopItems.map(item => `**ID:** \`${item.id}\` | **${item.name}**\n> ${item.description}\n> **Price:** 💰 ${item.price} coins`).join('\n\n');
 
@@ -1685,6 +1721,7 @@ const commands = [
       .addStringOption(o => o.setName('id').setDescription('Item ID from the shop').setRequired(true)),
     async execute(interaction) {
       const id = interaction.options.getString('id');
+      if (!CONFIG.economy.shopItems) return interaction.reply({ content: '❌ The shop is currently disabled.', flags: 64 });
       const item = CONFIG.economy.shopItems.find(i => i.id === id);
       if (!item) return interaction.reply({ content: '❌ Item not found in the shop.', flags: 64 });
 
@@ -2385,6 +2422,30 @@ const { Welcome, Leave } = require('canvafy');
 const { AttachmentBuilder } = require('discord.js');
 
 client.on('guildMemberAdd', async member => {
+  // Alt-account detection
+  if (CONFIG.verification.minAccountAgeDays > 0) {
+    const minMs = CONFIG.verification.minAccountAgeDays * 24 * 60 * 60 * 1000;
+    const accountAgeMs = Date.now() - member.user.createdTimestamp;
+
+    if (accountAgeMs < minMs) {
+      try {
+        await member.send(`You have been automatically kicked from **${member.guild.name}** because your account is too new. Minimum age required: ${CONFIG.verification.minAccountAgeDays} days.`);
+      } catch (e) {}
+
+      await member.kick(`Alt-Account Protection: Account younger than ${CONFIG.verification.minAccountAgeDays} days`);
+
+      await sendLog(member.guild, new EmbedBuilder()
+        .setColor(0xE74C3C)
+        .setTitle('🛡️ Anti-Raid: Alt Account Kicked')
+        .addFields(
+          { name: 'User', value: `${member.user.tag}`, inline: true },
+          { name: 'Age', value: `<t:${Math.floor(member.user.createdTimestamp / 1000)}:R>`, inline: true }
+        )
+      );
+      return; // Stop further processing for this member
+    }
+  }
+
   if (!CONFIG.logChannelId && !CONFIG.welcome.channelId) return;
   try {
     const embed = new EmbedBuilder()
@@ -2458,6 +2519,78 @@ client.on('guildMemberRemove', async member => {
   } catch (e) {
     console.error('[ERR] guildMemberRemove:', e.message);
   }
+});
+
+// ============================================================
+//  EXTENDED LOGGING
+// ============================================================
+client.on('messageUpdate', async (oldMsg, newMsg) => {
+  if (oldMsg.author?.bot || !oldMsg.guild || !CONFIG.logChannelId) return;
+  if (oldMsg.content === newMsg.content) return;
+
+  const embed = new EmbedBuilder()
+    .setColor(0xF1C40F)
+    .setTitle('📝 Message Edited')
+    .setAuthor({ name: oldMsg.author.tag, iconURL: oldMsg.author.displayAvatarURL() })
+    .addFields(
+      { name: 'Channel', value: `${oldMsg.channel}`, inline: true },
+      { name: 'Message', value: `[Jump to Message](${newMsg.url})`, inline: true },
+      { name: 'Before', value: oldMsg.content ? oldMsg.content.slice(0, 1024) : '*None/Attachment*' },
+      { name: 'After', value: newMsg.content ? newMsg.content.slice(0, 1024) : '*None/Attachment*' }
+    )
+    .setTimestamp();
+
+  await sendLog(oldMsg.guild, embed);
+});
+
+client.on('messageDelete', async msg => {
+  if (msg.author?.bot || !msg.guild || !CONFIG.logChannelId) return;
+
+  const embed = new EmbedBuilder()
+    .setColor(0xE74C3C)
+    .setTitle('🗑️ Message Deleted')
+    .setAuthor({ name: msg.author.tag, iconURL: msg.author.displayAvatarURL() })
+    .addFields(
+      { name: 'Channel', value: `${msg.channel}`, inline: true },
+      { name: 'Content', value: msg.content ? msg.content.slice(0, 1024) : '*None/Attachment*' }
+    )
+    .setTimestamp();
+
+  await sendLog(msg.guild, embed);
+});
+
+client.on('roleUpdate', async (oldRole, newRole) => {
+  if (!CONFIG.logChannelId) return;
+
+  if (oldRole.name !== newRole.name || oldRole.color !== newRole.color || oldRole.permissions.bitfield !== newRole.permissions.bitfield) {
+    const embed = new EmbedBuilder()
+      .setColor(0x3498DB)
+      .setTitle('🔧 Role Updated')
+      .setDescription(`Role **${newRole.name}** was updated.`)
+      .setTimestamp();
+
+    await sendLog(newRole.guild, embed);
+  }
+});
+
+client.on('channelCreate', async channel => {
+  if (!channel.guild || !CONFIG.logChannelId) return;
+  const embed = new EmbedBuilder()
+    .setColor(0x2ECC71)
+    .setTitle('📁 Channel Created')
+    .setDescription(`Channel ${channel} (\`${channel.name}\`) was created.`)
+    .setTimestamp();
+  await sendLog(channel.guild, embed);
+});
+
+client.on('channelDelete', async channel => {
+  if (!channel.guild || !CONFIG.logChannelId) return;
+  const embed = new EmbedBuilder()
+    .setColor(0xE74C3C)
+    .setTitle('📁 Channel Deleted')
+    .setDescription(`Channel \`${channel.name}\` was deleted.`)
+    .setTimestamp();
+  await sendLog(channel.guild, embed);
 });
 
 // ============================================================
@@ -2769,6 +2902,11 @@ app.get('/api/config', (req, res) => {
     oauth2: CONFIG.oauth2,
     allowedLinkRoles: CONFIG.allowedLinkRoles,
     wordFilterExemptRoles: CONFIG.wordFilterExemptRoles,
+    moderation: CONFIG.moderation,
+    economy: CONFIG.economy,
+    fivemServer: CONFIG.fivemServer,
+    welcome: CONFIG.welcome,
+    verification: CONFIG.verification,
   });
 });
 
@@ -2882,7 +3020,7 @@ app.get('/', (req, res) => {
         </div>
         <nav class="space-y-2">
           <a href="#" onclick="switchTab(0)" class="nav-link flex items-center gap-3 px-6 py-4 rounded-2xl font-medium active"><i class="fas fa-tachometer-alt w-6"></i> Overview</a>
-          <a href="#" onclick="switchTab(1)" class="nav-link flex items-center gap-3 px-6 py-4 rounded-2xl font-medium"><i class="fas fa-cogs w-6"></i> General</a>
+          <a href="#" onclick="switchTab(1)" class="nav-link flex items-center gap-3 px-6 py-4 rounded-2xl font-medium"><i class="fas fa-cogs w-6"></i> Configuration</a>
           <a href="#" onclick="switchTab(2)" class="nav-link flex items-center gap-3 px-6 py-4 rounded-2xl font-medium"><i class="fas fa-shield-alt w-6"></i> Security</a>
           <a href="#" onclick="switchTab(3)" class="nav-link flex items-center gap-3 px-6 py-4 rounded-2xl font-medium"><i class="fas fa-ticket w-6"></i> Tickets</a>
           <a href="#" onclick="switchTab(4)" class="nav-link flex items-center gap-3 px-6 py-4 rounded-2xl font-medium"><i class="fas fa-gift w-6"></i> Giveaways</a>
@@ -2908,6 +3046,16 @@ app.get('/', (req, res) => {
         <!-- OVERVIEW -->
         <div id="tab-0" class="tab-content">
           <div class="grid grid-cols-2 lg:grid-cols-4 gap-6" id="statsGrid"></div>
+        </div>
+
+        <!-- CONFIGURATION -->
+        <div id="tab-1" class="tab-content hidden">
+          <div class="glass rounded-3xl p-10">
+            <h3 class="text-2xl font-bold mb-8">Dynamic Configuration</h3>
+            <div id="configForm" class="space-y-6">
+              <!-- Dynamically populated by JS -->
+            </div>
+          </div>
         </div>
 
         <!-- SECURITY -->
@@ -3011,9 +3159,58 @@ app.get('/', (req, res) => {
 
     function switchTab(n) {
       document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
-      document.getElementById('tab-' + n).classList.remove('hidden');
-      const titles = ['Overview','General','Security','Tickets','Giveaways','Blacklist','KeyAuth','Accounts'];
+      const tabEl = document.getElementById('tab-' + n);
+      if (tabEl) tabEl.classList.remove('hidden');
+      const titles = ['Overview','Configuration','Security','Tickets','Giveaways','Blacklist'];
       document.getElementById('pageTitle').textContent = titles[n];
+    }
+
+    async function loadConfig() {
+      const res = await fetch('/api/config');
+      const data = await res.json();
+
+      // Auto-generate form fields based on specific configs we want editable
+      const configMap = {
+        'fivemServer.ip': 'FiveM IP',
+        'fivemServer.port': 'FiveM Port',
+        'fivemServer.statusChannelId': 'FiveM Status Channel ID',
+        'moderation.maxWarnings': 'Max Warnings (before kick)',
+        'economy.dailyReward': 'Economy: Daily Reward Coins',
+        'verification.roleId': 'Verification Role ID',
+        'verification.minAccountAgeDays': 'Anti-Raid Min Account Age (Days)'
+      };
+
+      let formHtml = '';
+      for (const [key, label] of Object.entries(configMap)) {
+        // Resolve nested keys safely
+        const val = key.split('.').reduce((o, i) => (o ? o[i] : ''), data) || '';
+        formHtml += \`
+          <div>
+            <label class="block text-sm font-medium text-slate-400 mb-2">\${label}</label>
+            <div class="flex gap-3">
+              <input type="text" id="config-\${key}" value="\${val}" class="flex-1 bg-white/5 border border-white/10 rounded-xl px-4 py-3">
+              <button onclick="updateConfig('\${key}')" class="bg-indigo-600 px-6 rounded-xl font-medium">Save</button>
+            </div>
+          </div>
+        \`;
+      }
+      document.getElementById('configForm').innerHTML = formHtml;
+
+      const container = document.getElementById('wordsList');
+      container.innerHTML = data.blacklistedWords.map(w => 
+        \`<div class="bg-white/5 px-5 py-4 rounded-2xl flex justify-between"><span>\${w}</span><button onclick="removeWord('\${w}')" class="text-red-400 text-xl">×</button></div>\`
+      ).join('');
+    }
+
+    async function updateConfig(key) {
+      const value = document.getElementById('config-' + key).value;
+      const parsedValue = isNaN(value) || value === '' ? value : Number(value);
+      await fetch('/api/config/update', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key, value: parsedValue })
+      });
+      alert('Saved!');
     }
 
     // Word Filter functions
@@ -3021,27 +3218,18 @@ app.get('/', (req, res) => {
       const word = document.getElementById('newWord').value.trim();
       if (!word) return;
       await fetch('/api/blacklist-words/add', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({word})});
-      loadWords();
+      loadConfig();
       document.getElementById('newWord').value = '';
-    }
-
-    async function loadWords() {
-      const res = await fetch('/api/config');
-      const data = await res.json();
-      const container = document.getElementById('wordsList');
-      container.innerHTML = data.blacklistedWords.map(w => 
-        \`<div class="bg-white/5 px-5 py-4 rounded-2xl flex justify-between"><span>\${w}</span><button onclick="removeWord('\${w}')" class="text-red-400 text-xl">×</button></div>\`
-      ).join('');
     }
 
     async function removeWord(word) {
       await fetch('/api/blacklist-words/remove', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({word})});
-      loadWords();
+      loadConfig();
     }
 
     // Init
     renderStats();
-    loadWords();
+    loadConfig();
     setInterval(refreshStats, 7000);
     setInterval(() => document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString(), 10000);
   </script>
@@ -3091,9 +3279,111 @@ process.on('uncaughtException', err => {
 });
 
 // ============================================================
+//  VERIFICATION STATE
+// ============================================================
+const activeCaptchas = new Map();
+
+const { ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
+const { Captcha } = require('canvafy');
+
+// ============================================================
 //  INTERACTIONS
 // ============================================================
 client.on('interactionCreate', async interaction => {
+
+  // Verification button
+  if (interaction.isButton() && interaction.customId === 'start_verification') {
+    if (!CONFIG.verification.roleId) return interaction.reply({ content: '❌ Verification system is not fully configured.', flags: 64 });
+    if (interaction.member.roles.cache.has(CONFIG.verification.roleId)) return interaction.reply({ content: '✅ You are already verified.', flags: 64 });
+
+    await interaction.deferReply({ flags: 64 });
+
+    const captchaText = Math.random().toString(36).substring(2, 8).toUpperCase();
+    activeCaptchas.set(interaction.user.id, captchaText);
+
+    try {
+      const captchaImage = await new Captcha()
+        .setBackground('image', 'https://i.imgur.com/4mXtF9Z.png')
+        .setCaptchaKey(captchaText)
+        .setBorder('#2a2e35')
+        .setOverlayOpacity(0.5)
+        .build();
+
+      const attachment = new AttachmentBuilder(captchaImage, { name: 'captcha.png' });
+
+      const modalButton = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('submit_captcha').setLabel('Submit Answer').setStyle(ButtonStyle.Primary)
+      );
+
+      await interaction.editReply({
+        content: 'Please solve the Captcha below to verify. Click the button to enter your answer.',
+        files: [attachment],
+        components: [modalButton]
+      });
+
+      // Auto-expire captcha after 3 minutes
+      setTimeout(() => {
+        if (activeCaptchas.has(interaction.user.id) && activeCaptchas.get(interaction.user.id) === captchaText) {
+          activeCaptchas.delete(interaction.user.id);
+        }
+      }, 3 * 60 * 1000);
+    } catch (e) {
+      console.error('[ERR] Captcha generation failed:', e);
+      return interaction.editReply({ content: '❌ An error occurred while generating the Captcha.' });
+    }
+    return;
+  }
+
+  // Captcha modal open
+  if (interaction.isButton() && interaction.customId === 'submit_captcha') {
+    if (!activeCaptchas.has(interaction.user.id)) {
+      return interaction.reply({ content: '❌ Your Captcha has expired. Please click "Verify" again.', flags: 64 });
+    }
+
+    const modal = new ModalBuilder()
+      .setCustomId('captcha_modal')
+      .setTitle('Captcha Verification');
+
+    const textInput = new TextInputBuilder()
+      .setCustomId('captcha_input')
+      .setLabel('Enter the text from the image')
+      .setStyle(TextInputStyle.Short)
+      .setRequired(true)
+      .setMaxLength(6)
+      .setMinLength(6);
+
+    const actionRow = new ActionRowBuilder().addComponents(textInput);
+    modal.addComponents(actionRow);
+
+    await interaction.showModal(modal);
+    return;
+  }
+
+  // Captcha modal submit
+  if (interaction.isModalSubmit() && interaction.customId === 'captcha_modal') {
+    const expected = activeCaptchas.get(interaction.user.id);
+    const provided = interaction.fields.getTextInputValue('captcha_input').toUpperCase();
+
+    if (!expected) {
+      return interaction.reply({ content: '❌ Your Captcha session expired. Try again.', flags: 64 });
+    }
+
+    if (expected !== provided) {
+      activeCaptchas.delete(interaction.user.id);
+      return interaction.reply({ content: '❌ Incorrect Captcha. Please click "Verify" to get a new one.', flags: 64 });
+    }
+
+    // Correct answer
+    activeCaptchas.delete(interaction.user.id);
+    try {
+      await interaction.member.roles.add(CONFIG.verification.roleId, 'Passed Captcha Verification');
+      await interaction.reply({ content: '✅ You have been verified successfully!', flags: 64 });
+    } catch (e) {
+      console.error('[ERR] Failed to assign verification role:', e);
+      await interaction.reply({ content: '❌ I could not assign the verified role. Check my permissions.', flags: 64 });
+    }
+    return;
+  }
 
   // Giveaway button
   if (interaction.isButton() && interaction.customId.startsWith('giveaway_enter:')) {
