@@ -35,7 +35,6 @@ const DEPS = [
   'dotenv',           // Load environment variables from .env
   'express',          // HTTP API server for license verification
   'canvafy',          // Welcome/Goodbye images
-  'gamedig',          // FiveM server status
 ];
 
 function isInstalled(pkg) {
@@ -2980,6 +2979,13 @@ app.get('/api/check-verification/:code', (req, res) => {
 
 // ── Web Dashboard ─────────────────────────────────────────
 app.get('/api/stats', (req, res) => {
+  const guildList = client.guilds.cache.map(g => ({
+    id: g.id,
+    name: g.name,
+    iconUrl: g.iconURL({ size: 64 }) || null,
+    memberCount: g.memberCount
+  }));
+
   const stats = {
     servers: client.guilds.cache.size,
     users: client.users.cache.size,
@@ -2991,6 +2997,7 @@ app.get('/api/stats', (req, res) => {
     steamAccounts: accountPools.steam.length,
     discordAccounts: accountPools.discord.length,
     fivemAccounts: accountPools.fivem.length,
+    guildList: guildList
   };
   res.json(stats);
 });
@@ -3057,226 +3064,116 @@ app.post('/api/blacklist-words/remove', (req, res) => {
 
 // ── FULL INTERACTIVE DASHBOARD (Tickets + Blacklist + Giveaways Live) ───────────────────────
 app.get('/', (req, res) => {
-  const stats = {
-    servers: client.guilds.cache.size,
-    users: client.users.cache.size,
-    giveaways: giveaways.size,
-    activeTickets: activeTickets.size,
-    blacklisted: blacklistMap.size,
-    keyauthRedemptions: keyauthRedemptions.size,
-    uptime: client.uptime || 0,
-    steamAccounts: accountPools.steam.length,
-    discordAccounts: accountPools.discord.length,
-    fivemAccounts: accountPools.fivem.length,
-  };
-
-  // Prepare data for tickets, blacklist, giveaways
-  const activeGiveawaysData = [...giveaways.values()]
-    .filter(g => !g.ended)
-    .map(g => ({
-      id: g.id,
-      prize: g.prize,
-      type: g.type,
-      entrants: g.entrants.size,
-      endsAt: g.endsAt
-    }));
-
-  const activeTicketsData = [...activeTickets.values()].map(t => ({
-    channelId: t.channelId || 'Unknown',
-    user: t.username,
-    opened: t.createdAt
-  }));
-
-  const blacklistData = [...blacklistMap.values()].map(b => ({
-    userId: b.userId,
-    username: b.username,
-    reason: b.reason,
-    addedAt: b.addedAt
-  }));
-
   const html = `
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Susano Bot • Dashboard</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.6.0/css/all.min.css">
+  <script src="https://unpkg.com/react@17/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@17/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/@fluentui/react@8/dist/fluentui-react.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-    body { font-family: 'Inter', system-ui, sans-serif; }
-    .glass { background: rgba(255,255,255,0.06); backdrop-filter: blur(20px); border: 1px solid rgba(255,255,255,0.1); }
-    .card-hover:hover { transform: translateY(-8px); box-shadow: 0 25px 50px -12px rgb(0 0 0 / 0.4); }
-    .nav-link { transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); }
-    .nav-link:hover, .nav-link.active { background: rgba(99, 102, 241, 0.25); color: #c4d0ff; border-left: 4px solid #6366f1; }
-    .stat-value { font-size: 2.75rem; font-weight: 700; background: linear-gradient(90deg, #a5b4fc, #e0e7ff); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+    body { margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f3f2f1; }
+    #root { height: 100vh; display: flex; flex-direction: column; }
+    .header { background: #0078d4; color: white; padding: 16px 32px; display: flex; align-items: center; justify-content: space-between; }
+    .header h1 { margin: 0; font-size: 24px; font-weight: 600; }
+    .content-area { padding: 32px; flex: 1; overflow-y: auto; max-width: 1200px; margin: 0 auto; width: 100%; box-sizing: border-box; }
+    .stat-card { background: white; padding: 20px; border-radius: 4px; box-shadow: 0 1.6px 3.6px 0 rgba(0,0,0,0.132), 0 0.3px 0.9px 0 rgba(0,0,0,0.108); }
+    .stat-title { font-size: 14px; color: #605e5c; margin-bottom: 8px; font-weight: 600; text-transform: uppercase; }
+    .stat-value { font-size: 28px; font-weight: 300; color: #323130; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 32px; }
+    .server-card { display: flex; align-items: center; background: white; padding: 16px; border-radius: 4px; box-shadow: 0 1.6px 3.6px 0 rgba(0,0,0,0.132), 0 0.3px 0.9px 0 rgba(0,0,0,0.108); gap: 16px;}
+    .server-card img { width: 48px; height: 48px; border-radius: 50%; }
+    .server-card .info { flex: 1; }
+    .server-card .name { font-weight: 600; font-size: 16px; color: #323130; }
+    .server-card .members { font-size: 12px; color: #605e5c; }
+    .config-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
   </style>
 </head>
-<body class="bg-gradient-to-br from-[#0a0a14] via-[#111827] to-[#1e2937] text-slate-200 min-h-screen">
-  <div class="flex min-h-screen">
-    <!-- Sidebar -->
-    <div class="w-72 glass border-r border-white/10 h-screen fixed overflow-y-auto">
-      <div class="p-8">
-        <div class="flex items-center gap-4 mb-12">
-          <div class="w-12 h-12 bg-gradient-to-br from-indigo-500 to-violet-600 rounded-3xl flex items-center justify-center text-4xl shadow-xl">🛡️</div>
-          <div>
-            <h1 class="text-3xl font-bold tracking-tighter">Susano Bot</h1>
-            <p class="text-indigo-400 text-sm">Native Menu • Powered</p>
-          </div>
-        </div>
-        <nav class="space-y-2">
-          <a href="#" onclick="switchTab(0)" class="nav-link flex items-center gap-3 px-6 py-4 rounded-2xl font-medium active"><i class="fas fa-tachometer-alt w-6"></i> Overview</a>
-          <a href="#" onclick="switchTab(1)" class="nav-link flex items-center gap-3 px-6 py-4 rounded-2xl font-medium"><i class="fas fa-cogs w-6"></i> Configuration</a>
-          <a href="#" onclick="switchTab(2)" class="nav-link flex items-center gap-3 px-6 py-4 rounded-2xl font-medium"><i class="fas fa-shield-alt w-6"></i> Security</a>
-          <a href="#" onclick="switchTab(3)" class="nav-link flex items-center gap-3 px-6 py-4 rounded-2xl font-medium"><i class="fas fa-ticket w-6"></i> Tickets</a>
-          <a href="#" onclick="switchTab(4)" class="nav-link flex items-center gap-3 px-6 py-4 rounded-2xl font-medium"><i class="fas fa-gift w-6"></i> Giveaways</a>
-          <a href="#" onclick="switchTab(5)" class="nav-link flex items-center gap-3 px-6 py-4 rounded-2xl font-medium"><i class="fas fa-ban w-6"></i> Blacklist</a>
-        </nav>
-      </div>
-    </div>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const {
+      ThemeProvider, initializeIcons, Pivot, PivotItem,
+      TextField, PrimaryButton, Label, Stack, Separator, Spinner, SpinnerSize
+    } = window.FluentUIReact;
 
-    <!-- Main Content -->
-    <div class="flex-1 ml-72">
-      <header class="glass border-b border-white/10 px-10 py-6 flex justify-between items-center sticky top-0 z-50">
-        <h2 class="text-4xl font-semibold tracking-tight" id="pageTitle">Overview</h2>
-        <div class="flex items-center gap-6">
-          <div class="bg-emerald-500/20 text-emerald-400 px-5 py-2 rounded-3xl flex items-center gap-3">
-            <div class="w-3 h-3 bg-emerald-400 rounded-full animate-pulse"></div> ONLINE
-          </div>
-          <span id="lastUpdate" class="text-slate-400"></span>
-        </div>
-      </header>
-
-      <div class="p-10 max-w-7xl mx-auto space-y-12">
-
-        <!-- OVERVIEW -->
-        <div id="tab-0" class="tab-content">
-          <div class="grid grid-cols-2 lg:grid-cols-4 gap-6" id="statsGrid"></div>
-        </div>
-
-        <!-- CONFIGURATION -->
-        <div id="tab-1" class="tab-content hidden">
-          <div class="glass rounded-3xl p-10">
-            <h3 class="text-2xl font-bold mb-8">Dynamic Configuration</h3>
-            <div id="configForm" class="space-y-6">
-              <!-- Dynamically populated by JS -->
-            </div>
-          </div>
-        </div>
-
-        <!-- SECURITY -->
-        <div id="tab-2" class="tab-content hidden">
-          <div class="glass rounded-3xl p-10">
-            <h3 class="text-2xl font-bold mb-8">Security & Protection</h3>
-            <div class="mb-12">
-              <h4 class="font-semibold mb-4">Word Filter</h4>
-              <div class="flex gap-3 mb-6">
-                <input id="newWord" placeholder="Add word or phrase" class="flex-1 bg-white/5 border border-white/10 rounded-2xl px-6 py-5">
-                <button onclick="addBlacklistWord()" class="bg-indigo-600 px-10 rounded-2xl">Add</button>
-              </div>
-              <div id="wordsList" class="grid grid-cols-3 gap-3"></div>
-            </div>
-          </div>
-        </div>
-
-        <!-- TICKETS -->
-        <div id="tab-3" class="tab-content hidden">
-          <div class="glass rounded-3xl p-10">
-            <h3 class="text-2xl font-bold mb-6">Active Tickets (${activeTicketsData.length})</h3>
-            <div class="space-y-4" id="ticketsList">
-              ${activeTicketsData.length ? activeTicketsData.map(t => `
-                <div class="glass p-5 rounded-2xl flex justify-between items-center">
-                  <div>
-                    <strong>${t.user}</strong><br>
-                    <small class="text-slate-400">#${t.channelId}</small>
-                  </div>
-                  <div class="text-right text-sm text-slate-400">
-                    Opened: ${new Date(t.opened).toLocaleDateString()}
-                  </div>
-                </div>
-              `).join('') : '<p class="text-slate-400">No active tickets.</p>'}
-            </div>
-          </div>
-        </div>
-
-        <!-- GIVEAWAYS -->
-        <div id="tab-4" class="tab-content hidden">
-          <div class="glass rounded-3xl p-10">
-            <h3 class="text-2xl font-bold mb-6">Active Giveaways (${activeGiveawaysData.length})</h3>
-            <div class="space-y-4" id="giveawaysList">
-              ${activeGiveawaysData.length ? activeGiveawaysData.map(g => `
-                <div class="glass p-5 rounded-2xl">
-                  <div class="flex justify-between">
-                    <div><strong>${g.prize}</strong> <span class="text-indigo-400">(${g.type})</span></div>
-                    <div class="text-sm text-slate-400">${g.entrants} entrants</div>
-                  </div>
-                  <small class="text-slate-400">Ends: ${new Date(g.endsAt).toLocaleString()}</small>
-                </div>
-              `).join('') : '<p class="text-slate-400">No active giveaways.</p>'}
-            </div>
-          </div>
-        </div>
-
-        <!-- BLACKLIST -->
-        <div id="tab-5" class="tab-content hidden">
-          <div class="glass rounded-3xl p-10">
-            <h3 class="text-2xl font-bold mb-6">Blacklisted Users (${blacklistData.length})</h3>
-            <div class="space-y-4" id="blacklistList">
-              ${blacklistData.length ? blacklistData.map(b => `
-                <div class="glass p-5 rounded-2xl">
-                  <strong>${b.username}</strong><br>
-                  <small class="text-red-400">${b.reason}</small>
-                </div>
-              `).join('') : '<p class="text-slate-400">No blacklisted users.</p>'}
-            </div>
-          </div>
-        </div>
-
-      </div>
-    </div>
-  </div>
-
-  <script>
-    let currentStats = ${JSON.stringify(stats)};
-
-    function renderStats() {
-      const html = \`
-        <div class="glass rounded-3xl p-8 card-hover"><div class="flex justify-between"><div><p class="text-slate-400">Servers</p><p class="stat-value">\${currentStats.servers}</p></div><i class="fas fa-server text-6xl text-indigo-400/30"></i></div></div>
-        <div class="glass rounded-3xl p-8 card-hover"><div class="flex justify-between"><div><p class="text-slate-400">Users</p><p class="stat-value">\${currentStats.users.toLocaleString()}</p></div><i class="fas fa-users text-6xl text-purple-400/30"></i></div></div>
-        <div class="glass rounded-3xl p-8 card-hover"><div class="flex justify-between"><div><p class="text-slate-400">Uptime</p><p class="stat-value">\${formatUptime(currentStats.uptime)}</p></div><i class="fas fa-clock text-6xl text-emerald-400/30"></i></div></div>
-        <div class="glass rounded-3xl p-8 card-hover"><div class="flex justify-between"><div><p class="text-slate-400">Blacklisted</p><p class="stat-value text-red-400">\${currentStats.blacklisted}</p></div><i class="fas fa-ban text-6xl text-red-400/30"></i></div></div>
-      \`;
-      document.getElementById('statsGrid').innerHTML = html;
-    }
+    initializeIcons();
 
     function formatUptime(ms) {
-      const d = Math.floor(ms / 86400000);
-      const h = Math.floor((ms % 86400000) / 3600000);
-      return d ? \`\${d}d \${h}h\` : \`\${h}h\`;
+      if (!ms) return 'Just started';
+      const seconds = Math.floor((ms / 1000) % 60);
+      const minutes = Math.floor((ms / (1000 * 60)) % 60);
+      const hours = Math.floor((ms / (1000 * 60 * 60)) % 24);
+      const days = Math.floor(ms / (1000 * 60 * 60 * 24));
+      if (days > 0) return \`\${days}d \${hours}h \${minutes}m\`;
+      if (hours > 0) return \`\${hours}h \${minutes}m \${seconds}s\`;
+      if (minutes > 0) return \`\${minutes}m \${seconds}s\`;
+      return \`\${seconds}s\`;
     }
 
-    async function refreshStats() {
-      try {
-        const res = await fetch('/api/stats');
-        currentStats = await res.json();
-        renderStats();
-      } catch(e) {}
-    }
+    function App() {
+      const [stats, setStats] = React.useState(null);
+      const [config, setConfig] = React.useState(null);
+      const [formValues, setFormValues] = React.useState({});
+      const [saving, setSaving] = React.useState(false);
 
-    function switchTab(n) {
-      document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
-      const tabEl = document.getElementById('tab-' + n);
-      if (tabEl) tabEl.classList.remove('hidden');
-      const titles = ['Overview','Configuration','Security','Tickets','Giveaways','Blacklist'];
-      document.getElementById('pageTitle').textContent = titles[n];
-    }
+      React.useEffect(() => {
+        fetchData();
+        const interval = setInterval(fetchData, 15000);
+        return () => clearInterval(interval);
+      }, []);
 
-    async function loadConfig() {
-      const res = await fetch('/api/config');
-      const data = await res.json();
+      const fetchData = async () => {
+        try {
+          const [statsRes, configRes] = await Promise.all([
+            fetch('/api/stats'),
+            fetch('/api/config')
+          ]);
+          const statsData = await statsRes.json();
+          const configData = await configRes.json();
 
-      // Auto-generate form fields based on specific configs we want editable
+          setStats(statsData);
+          setConfig(configData);
+
+          if (Object.keys(formValues).length === 0) {
+            setFormValues({
+              'fivemServer.ip': configData.fivemServer?.ip || '',
+              'fivemServer.port': configData.fivemServer?.port || '',
+              'fivemServer.statusChannelId': configData.fivemServer?.statusChannelId || '',
+              'moderation.maxWarnings': configData.moderation?.maxWarnings || '',
+              'economy.dailyReward': configData.economy?.dailyReward || '',
+              'verification.roleId': configData.verification?.roleId || '',
+              'verification.minAccountAgeDays': configData.verification?.minAccountAgeDays || '',
+              'tempVoice.hubChannelId': configData.tempVoice?.hubChannelId || '',
+              'tempVoice.categoryId': configData.tempVoice?.categoryId || ''
+            });
+          }
+        } catch (e) {
+          console.error("Failed to fetch data", e);
+        }
+      };
+
+      const handleSave = async (key) => {
+        setSaving(true);
+        try {
+          let value = formValues[key];
+          if (!isNaN(value) && value !== '') value = Number(value);
+
+          await fetch('/api/config/update', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ key, value })
+          });
+        } finally {
+          setSaving(false);
+        }
+      };
+
+      if (!stats || !config) return <div style={{padding: 40}}><Spinner size={SpinnerSize.large} label="Loading Dashboard..." /></div>;
+
       const configMap = {
         'fivemServer.ip': 'FiveM IP',
         'fivemServer.port': 'FiveM Port',
@@ -3289,61 +3186,89 @@ app.get('/', (req, res) => {
         'tempVoice.categoryId': 'Temp Voice Category ID'
       };
 
-      let formHtml = '';
-      for (const [key, label] of Object.entries(configMap)) {
-        // Resolve nested keys safely
-        const val = key.split('.').reduce((o, i) => (o ? o[i] : ''), data) || '';
-        formHtml += \`
-          <div>
-            <label class="block text-sm font-medium text-slate-400 mb-2">\${label}</label>
-            <div class="flex gap-3">
-              <input type="text" id="config-\${key}" value="\${val}" class="flex-1 bg-white/5 border border-white/10 rounded-xl px-4 py-3">
-              <button onclick="updateConfig('\${key}')" class="bg-indigo-600 px-6 rounded-xl font-medium">Save</button>
-            </div>
+      return (
+        <ThemeProvider>
+          <div className="header">
+            <h1>🛡️ Susano Bot Dashboard</h1>
+            <div style={{fontSize: 14, opacity: 0.9}}>Online &bull; Uptime: {formatUptime(stats.uptime)}</div>
           </div>
-        \`;
-      }
-      document.getElementById('configForm').innerHTML = formHtml;
 
-      const container = document.getElementById('wordsList');
-      container.innerHTML = data.blacklistedWords.map(w => 
-        \`<div class="bg-white/5 px-5 py-4 rounded-2xl flex justify-between"><span>\${w}</span><button onclick="removeWord('\${w}')" class="text-red-400 text-xl">×</button></div>\`
-      ).join('');
+          <div className="content-area">
+            <Pivot aria-label="Dashboard Tabs">
+              <PivotItem headerText="Overview" itemIcon="BarChart4">
+                <div style={{marginTop: 24}}>
+                  <div className="grid">
+                    <div className="stat-card">
+                      <div className="stat-title">Servers</div>
+                      <div className="stat-value">{stats.servers}</div>
+                    </div>
+                    <div className="stat-card">
+                      <div className="stat-title">Users</div>
+                      <div className="stat-value">{stats.users.toLocaleString()}</div>
+                    </div>
+                    <div className="stat-card">
+                      <div className="stat-title">Blacklisted</div>
+                      <div className="stat-value" style={{color: '#d13438'}}>{stats.blacklisted}</div>
+                    </div>
+                    <div className="stat-card">
+                      <div className="stat-title">Active Tickets</div>
+                      <div className="stat-value">{stats.activeTickets}</div>
+                    </div>
+                  </div>
+
+                  <h2 style={{fontSize: 20, fontWeight: 600, marginTop: 40, marginBottom: 20}}>Connected Servers</h2>
+                  <div className="grid">
+                    {stats.guildList && stats.guildList.map(g => (
+                      <div className="server-card" key={g.id}>
+                        <img src={g.iconUrl || 'https://cdn.discordapp.com/embed/avatars/0.png'} alt={g.name} />
+                        <div className="info">
+                          <div className="name">{g.name}</div>
+                          <div className="members">{g.memberCount} members</div>
+                        </div>
+                      </div>
+                    ))}
+                    {(!stats.guildList || stats.guildList.length === 0) && <div>No servers found.</div>}
+                  </div>
+                </div>
+              </PivotItem>
+
+              <PivotItem headerText="Configuration" itemIcon="Settings">
+                <div style={{marginTop: 24}}>
+                  <h2 style={{fontSize: 20, fontWeight: 600, marginBottom: 20}}>Dynamic Configuration</h2>
+                  <p style={{color: '#605e5c', marginBottom: 24}}>Update bot modules in real-time. Settings apply immediately.</p>
+
+                  <div className="config-grid">
+                    {Object.entries(configMap).map(([key, label]) => (
+                      <div key={key} className="stat-card">
+                        <TextField
+                          label={label}
+                          value={formValues[key]}
+                          onChange={(e, v) => setFormValues({...formValues, [key]: v})}
+                          disabled={saving}
+                        />
+                        <PrimaryButton
+                          text="Save"
+                          onClick={() => handleSave(key)}
+                          style={{marginTop: 12}}
+                          disabled={saving}
+                        />
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </PivotItem>
+            </Pivot>
+          </div>
+        </ThemeProvider>
+      );
     }
 
-    async function updateConfig(key) {
-      const value = document.getElementById('config-' + key).value;
-      const parsedValue = isNaN(value) || value === '' ? value : Number(value);
-      await fetch('/api/config/update', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ key, value: parsedValue })
-      });
-      alert('Saved!');
-    }
-
-    // Word Filter functions
-    async function addBlacklistWord() {
-      const word = document.getElementById('newWord').value.trim();
-      if (!word) return;
-      await fetch('/api/blacklist-words/add', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({word})});
-      loadConfig();
-      document.getElementById('newWord').value = '';
-    }
-
-    async function removeWord(word) {
-      await fetch('/api/blacklist-words/remove', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({word})});
-      loadConfig();
-    }
-
-    // Init
-    renderStats();
-    loadConfig();
-    setInterval(refreshStats, 7000);
-    setInterval(() => document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString(), 10000);
+    ReactDOM.render(<App />, document.getElementById('root'));
   </script>
 </body>
-</html>`;
+</html>
+
+`;
 
   res.send(html);
 });
