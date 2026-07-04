@@ -34,6 +34,7 @@ const DEPS = [
   'axios',            // HTTP requests for KeyAuth API
   'dotenv',           // Load environment variables from .env
   'express',          // HTTP API server for license verification
+  'canvafy',          // Welcome/Goodbye images
 ];
 
 function isInstalled(pkg) {
@@ -168,6 +169,45 @@ const CONFIG = {
     clientSecret: process.env.CLIENT_SECRET || process.env.DISCORD_CLIENT_SECRET || '',
     redirectUri:  process.env.DISCORD_OAUTH_REDIRECT_URI || 'http://localhost:3000/api/auth/callback',
   },
+
+  // ── Economy ────────────────────────────────────────────────
+  economy: {
+    dailyReward: 500,
+    xpPerMessage: { min: 5, max: 15 },
+    xpCooldownMs: 60000,
+    levelRoles: [],
+    shopItems: [],
+  },
+
+  // ── FiveM Server ───────────────────────────────────────────
+  fivemServer: {
+    ip: process.env.FIVEM_IP || '127.0.0.1',
+    port: process.env.FIVEM_PORT || '30120',
+  },
+
+  // ── Welcome/Goodbye ────────────────────────────────────────
+  welcome: {
+    channelId: process.env.WELCOME_CHANNEL_ID || null,
+    backgroundUrl: process.env.WELCOME_BG_URL || 'https://i.imgur.com/4mXtF9Z.png',
+  },
+
+  // ── Moderation ─────────────────────────────────────────────
+  moderation: {
+    maxWarnings: 3, // Auto-action after this many warnings
+  },
+
+  // ── Verification / Anti-Raid ───────────────────────────────
+  verification: {
+    channelId: process.env.VERIFICATION_CHANNEL_ID || null,
+    roleId: process.env.VERIFIED_ROLE_ID || null,
+    minAccountAgeDays: 7, // Kick accounts younger than this
+  },
+
+  // ── Temp Voice Channels ────────────────────────────────────
+  tempVoice: {
+    hubChannelId: process.env.TEMP_VOICE_HUB_ID || null,
+    categoryId: process.env.TEMP_VOICE_CATEGORY_ID || null,
+  },
 };
 
 // ============================================================
@@ -182,6 +222,8 @@ const TICKETS_FILE    = path.join(DATA_DIR, 'tickets.json');
 const BLACKLIST_FILE  = path.join(DATA_DIR, 'blacklist.json');
 const KEYAUTH_FILE    = path.join(DATA_DIR, 'keyauth_redemptions.json');
 const VERIFICATIONS_FILE = path.join(DATA_DIR, 'verifications.json');
+const WARNINGS_FILE   = path.join(DATA_DIR, 'warnings.json');
+const ECONOMY_FILE    = path.join(DATA_DIR, 'economy.json');
 const POOL_FILES      = {
   steam:   path.join(ACCOUNTS_DIR, 'steam.txt'),
   discord: path.join(ACCOUNTS_DIR, 'discord.txt'),
@@ -263,6 +305,12 @@ function loadGiveaways(client) {
     console.log(`[DB]  ${n} giveaway(s) restored.`);
   } catch (e) { console.error('[ERR] loadGiveaways:', e.message); }
 }
+
+// ============================================================
+//  TEMP VOICE CHANNELS STATE
+// ============================================================
+// Structure: Map<channelId, ownerId>
+const tempVoiceChannels = new Map();
 
 // ============================================================
 //  TICKET PERSISTENCE
@@ -354,6 +402,50 @@ function loadVerifications() {
     saveVerifications();
     console.log(`[DB]  ${verificationCodes.size} verification code(s) loaded.`);
   } catch (e) { console.error('[ERR] loadVerifications:', e.message); }
+}
+
+// ============================================================
+//  WARNINGS PERSISTENCE
+// ============================================================
+// Structure: Map<userId, [ { reason, adminTag, timestamp } ]>
+const warningsMap = new Map();
+
+function saveWarnings() {
+  const data = {};
+  for (const [k, v] of warningsMap) data[k] = v;
+  fs.writeFileSync(WARNINGS_FILE, JSON.stringify(data, null, 2), 'utf8');
+}
+
+function loadWarnings() {
+  if (!fs.existsSync(WARNINGS_FILE)) return;
+  try {
+    const data = JSON.parse(fs.readFileSync(WARNINGS_FILE, 'utf8'));
+    for (const [k, v] of Object.entries(data)) warningsMap.set(k, v);
+    let count = 0;
+    for (const v of warningsMap.values()) count += v.length;
+    console.log(`[DB]  ${count} warning(s) restored across ${warningsMap.size} user(s).`);
+  } catch (e) { console.error('[ERR] loadWarnings:', e.message); }
+}
+
+// ============================================================
+//  ECONOMY PERSISTENCE
+// ============================================================
+// Structure: Map<userId, { balance, xp, level, lastXp, lastDaily }>
+const economyMap = new Map();
+
+function saveEconomy() {
+  const data = {};
+  for (const [k, v] of economyMap) data[k] = v;
+  fs.writeFileSync(ECONOMY_FILE, JSON.stringify(data, null, 2), 'utf8');
+}
+
+function loadEconomy() {
+  if (!fs.existsSync(ECONOMY_FILE)) return;
+  try {
+    const data = JSON.parse(fs.readFileSync(ECONOMY_FILE, 'utf8'));
+    for (const [k, v] of Object.entries(data)) economyMap.set(k, v);
+    console.log(`[DB]  ${economyMap.size} economy profile(s) restored.`);
+  } catch (e) { console.error('[ERR] loadEconomy:', e.message); }
 }
 
 // Generate random 8-character verification code
@@ -1452,6 +1544,474 @@ const commands = [
   },
 
   // ══════════════════════════════════════════════════════════
+  //  TEMP VOICE CHANNELS
+  // ══════════════════════════════════════════════════════════
+  {
+    data: new SlashCommandBuilder()
+      .setName('voice')
+      .setDescription('Manage your temporary voice channel')
+      .addSubcommand(s => s.setName('lock').setDescription('Lock your channel (prevent others from joining)'))
+      .addSubcommand(s => s.setName('unlock').setDescription('Unlock your channel'))
+      .addSubcommand(s => s.setName('limit').setDescription('Set a user limit').addIntegerOption(o => o.setName('amount').setDescription('Max users (0 for unlimited)').setMinValue(0).setMaxValue(99).setRequired(true)))
+      .addSubcommand(s => s.setName('rename').setDescription('Rename your channel').addStringOption(o => o.setName('name').setDescription('New name').setRequired(true))),
+    async execute(interaction) {
+      const channel = interaction.member.voice.channel;
+      if (!channel) return interaction.reply({ content: '❌ You are not in a voice channel.', flags: 64 });
+
+      const ownerId = tempVoiceChannels.get(channel.id);
+      if (!ownerId) return interaction.reply({ content: '❌ This is not a temporary voice channel.', flags: 64 });
+      if (ownerId !== interaction.user.id && !interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
+        return interaction.reply({ content: '❌ Only the channel owner can manage this channel.', flags: 64 });
+      }
+
+      const sub = interaction.options.getSubcommand();
+
+      if (sub === 'lock') {
+        await channel.permissionOverwrites.edit(interaction.guild.roles.everyone, { Connect: false });
+        return interaction.reply({ content: '🔒 Your channel has been locked.', flags: 64 });
+      }
+
+      if (sub === 'unlock') {
+        await channel.permissionOverwrites.edit(interaction.guild.roles.everyone, { Connect: null });
+        return interaction.reply({ content: '🔓 Your channel has been unlocked.', flags: 64 });
+      }
+
+      if (sub === 'limit') {
+        const amount = interaction.options.getInteger('amount');
+        await channel.setUserLimit(amount);
+        return interaction.reply({ content: `👥 Channel user limit set to **${amount === 0 ? 'Unlimited' : amount}**.`, flags: 64 });
+      }
+
+      if (sub === 'rename') {
+        const newName = interaction.options.getString('name');
+        await channel.setName(newName);
+        return interaction.reply({ content: `📝 Channel renamed to **${newName}**.`, flags: 64 });
+      }
+    },
+  },
+
+  // ══════════════════════════════════════════════════════════
+  //  ANTI-RAID / CAPTCHA VERIFICATION
+  // ══════════════════════════════════════════════════════════
+  {
+    data: new SlashCommandBuilder()
+      .setName('verification-setup')
+      .setDescription('Set up the Captcha verification panel')
+      .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+    async execute(interaction) {
+      if (!hasCommandPerm(interaction.member)) return interaction.reply({ content: '❌ No permission.', flags: 64 });
+      if (!CONFIG.verification.roleId) return interaction.reply({ content: '❌ Please configure the verification role ID first.', flags: 64 });
+
+      const embed = new EmbedBuilder()
+        .setColor(0x5865F2)
+        .setTitle('🛡️ Server Verification')
+        .setDescription('To gain access to the rest of the server, please click the button below and solve the Captcha.')
+        .setFooter({ text: 'Anti-Raid Protection' });
+
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('start_verification').setLabel('Verify').setStyle(ButtonStyle.Success).setEmoji('🛡️')
+      );
+
+      await interaction.channel.send({ embeds: [embed], components: [row] });
+      await interaction.reply({ content: '✅ Verification panel setup complete.', flags: 64 });
+    },
+  },
+
+  // ══════════════════════════════════════════════════════════
+  //  ECONOMY & LEVELING
+  // ══════════════════════════════════════════════════════════
+  {
+    data: new SlashCommandBuilder()
+      .setName('rank')
+      .setDescription('Check your or another user\'s level and XP')
+      .addUserOption(o => o.setName('user').setDescription('User to check').setRequired(false)),
+    async execute(interaction) {
+      const target = interaction.options.getUser('user') || interaction.user;
+      if (target.bot) return interaction.reply({ content: '❌ Bots do not have ranks.', flags: 64 });
+
+      const profile = economyMap.get(target.id) || { balance: 0, xp: 0, level: 0, lastXp: 0, lastDaily: 0 };
+      const nextLevelXp = (profile.level + 1) * 100;
+
+      await interaction.reply({
+        embeds: [new EmbedBuilder().setColor(0x57F287).setTitle(`${EMOJI.star} ${target.username}'s Rank`)
+          .setThumbnail(target.displayAvatarURL({ size: 256 }))
+          .addFields(
+            { name: 'Level', value: `\`${profile.level}\``, inline: true },
+            { name: 'XP', value: `\`${profile.xp} / ${nextLevelXp}\``, inline: true },
+          )],
+      });
+    },
+  },
+
+  {
+    data: new SlashCommandBuilder()
+      .setName('balance')
+      .setDescription('Check your coin balance')
+      .addUserOption(o => o.setName('user').setDescription('User to check').setRequired(false)),
+    async execute(interaction) {
+      const target = interaction.options.getUser('user') || interaction.user;
+      if (target.bot) return interaction.reply({ content: '❌ Bots do not have a balance.', flags: 64 });
+
+      const profile = economyMap.get(target.id) || { balance: 0, xp: 0, level: 0, lastXp: 0, lastDaily: 0 };
+
+      await interaction.reply({
+        embeds: [new EmbedBuilder().setColor(0xF1C40F).setTitle(`💰 ${target.username}'s Balance`)
+          .setDescription(`**Balance:** ${profile.balance} coins`)],
+      });
+    },
+  },
+
+  {
+    data: new SlashCommandBuilder()
+      .setName('daily')
+      .setDescription('Claim your daily coins'),
+    async execute(interaction) {
+      const profile = economyMap.get(interaction.user.id) || { balance: 0, xp: 0, level: 0, lastXp: 0, lastDaily: 0 };
+      const now = Date.now();
+      const oneDay = 24 * 60 * 60 * 1000;
+
+      if (now - profile.lastDaily < oneDay) {
+        const remaining = profile.lastDaily + oneDay - now;
+        const hours = Math.floor(remaining / (1000 * 60 * 60));
+        const minutes = Math.floor((remaining % (1000 * 60 * 60)) / (1000 * 60));
+        return interaction.reply({ content: `⏱️ You already claimed your daily reward! Try again in **${hours}h ${minutes}m**.`, flags: 64 });
+      }
+
+      profile.balance += CONFIG.economy.dailyReward;
+      profile.lastDaily = now;
+      economyMap.set(interaction.user.id, profile);
+      saveEconomy();
+
+      await interaction.reply({ content: `✅ You claimed your daily reward of **${CONFIG.economy.dailyReward} coins**! Your new balance is **${profile.balance} coins**.`, flags: 64 });
+    },
+  },
+
+  {
+    data: new SlashCommandBuilder()
+      .setName('addmoney')
+      .setDescription('Add money to a user')
+      .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
+      .addIntegerOption(o => o.setName('amount').setDescription('Amount').setRequired(true))
+      .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+    async execute(interaction) {
+      if (!hasCommandPerm(interaction.member)) return interaction.reply({ content: '❌ No permission.', flags: 64 });
+      const target = interaction.options.getUser('user');
+      const amount = interaction.options.getInteger('amount');
+
+      const profile = economyMap.get(target.id) || { balance: 0, xp: 0, level: 0, lastXp: 0, lastDaily: 0 };
+      profile.balance += amount;
+      economyMap.set(target.id, profile);
+      saveEconomy();
+
+      await interaction.reply({ content: `✅ Added **${amount} coins** to ${target.tag}. New balance: **${profile.balance} coins**.`, flags: 64 });
+    },
+  },
+
+  {
+    data: new SlashCommandBuilder()
+      .setName('removemoney')
+      .setDescription('Remove money from a user')
+      .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
+      .addIntegerOption(o => o.setName('amount').setDescription('Amount').setRequired(true))
+      .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+    async execute(interaction) {
+      if (!hasCommandPerm(interaction.member)) return interaction.reply({ content: '❌ No permission.', flags: 64 });
+      const target = interaction.options.getUser('user');
+      const amount = interaction.options.getInteger('amount');
+
+      const profile = economyMap.get(target.id) || { balance: 0, xp: 0, level: 0, lastXp: 0, lastDaily: 0 };
+      profile.balance = Math.max(0, profile.balance - amount);
+      economyMap.set(target.id, profile);
+      saveEconomy();
+
+      await interaction.reply({ content: `✅ Removed **${amount} coins** from ${target.tag}. New balance: **${profile.balance} coins**.`, flags: 64 });
+    },
+  },
+
+  {
+    data: new SlashCommandBuilder()
+      .setName('coinflip')
+      .setDescription('Gamble your coins in a coinflip')
+      .addIntegerOption(o => o.setName('amount').setDescription('Amount to bet').setRequired(true))
+      .addStringOption(o => o.setName('choice').setDescription('Heads or Tails').setRequired(true).addChoices({ name: 'Heads', value: 'heads' }, { name: 'Tails', value: 'tails' })),
+    async execute(interaction) {
+      const amount = interaction.options.getInteger('amount');
+      const choice = interaction.options.getString('choice');
+      if (amount <= 0) return interaction.reply({ content: '❌ Bet must be greater than 0.', flags: 64 });
+
+      const profile = economyMap.get(interaction.user.id) || { balance: 0, xp: 0, level: 0, lastXp: 0, lastDaily: 0 };
+      if (profile.balance < amount) return interaction.reply({ content: `❌ You only have **${profile.balance} coins**.`, flags: 64 });
+
+      const outcome = Math.random() < 0.5 ? 'heads' : 'tails';
+      if (outcome === choice) {
+        profile.balance += amount;
+        await interaction.reply(`🎉 You guessed **${choice}** and won **${amount} coins**! New balance: **${profile.balance} coins**.`);
+      } else {
+        profile.balance -= amount;
+        await interaction.reply(`😔 It was **${outcome}**. You lost **${amount} coins**. New balance: **${profile.balance} coins**.`);
+      }
+      economyMap.set(interaction.user.id, profile);
+      saveEconomy();
+    },
+  },
+
+  {
+    data: new SlashCommandBuilder()
+      .setName('shop')
+      .setDescription('View the shop'),
+    async execute(interaction) {
+      if (!CONFIG.economy.shopItems || !CONFIG.economy.shopItems.length) return interaction.reply({ content: '❌ The shop is empty.', flags: 64 });
+
+      const desc = CONFIG.economy.shopItems.map(item => `**ID:** \`${item.id}\` | **${item.name}**\n> ${item.description}\n> **Price:** 💰 ${item.price} coins`).join('\n\n');
+
+      await interaction.reply({
+        embeds: [new EmbedBuilder().setColor(0xF1C40F).setTitle('🛒 Server Shop')
+          .setDescription(desc)
+          .setFooter({ text: 'Use /buy <id> to purchase an item' })],
+      });
+    },
+  },
+
+  {
+    data: new SlashCommandBuilder()
+      .setName('buy')
+      .setDescription('Buy an item from the shop')
+      .addStringOption(o => o.setName('id').setDescription('Item ID from the shop').setRequired(true)),
+    async execute(interaction) {
+      const id = interaction.options.getString('id');
+      if (!CONFIG.economy.shopItems) return interaction.reply({ content: '❌ The shop is currently disabled.', flags: 64 });
+      const item = CONFIG.economy.shopItems.find(i => i.id === id);
+      if (!item) return interaction.reply({ content: '❌ Item not found in the shop.', flags: 64 });
+
+      const profile = economyMap.get(interaction.user.id) || { balance: 0, xp: 0, level: 0, lastXp: 0, lastDaily: 0 };
+      if (profile.balance < item.price) return interaction.reply({ content: `❌ You need **${item.price} coins** to buy this. You have **${profile.balance} coins**.`, flags: 64 });
+
+      if (item.roleId) {
+        if (!interaction.guild.roles.cache.has(item.roleId)) return interaction.reply({ content: '❌ The role for this item does not exist in the server.', flags: 64 });
+        if (interaction.member.roles.cache.has(item.roleId)) return interaction.reply({ content: '❌ You already have this role.', flags: 64 });
+
+        try {
+          await interaction.member.roles.add(item.roleId, 'Bought from shop');
+        } catch (e) {
+          return interaction.reply({ content: '❌ Could not give you the role. Please check my permissions.', flags: 64 });
+        }
+
+        profile.balance -= item.price;
+        economyMap.set(interaction.user.id, profile);
+        saveEconomy();
+        return interaction.reply(`✅ You successfully bought **${item.name}** for **${item.price} coins**!`);
+      } else if (item.type) {
+        // Test DM before taking account from pool
+        try {
+          // Send an initial message to see if we can DM them
+          await interaction.user.send(`${EMOJI.pkg} Preparing your **${item.type}** account...`);
+        } catch (e) {
+          return interaction.reply({ content: '❌ Please enable your DMs to receive the account.', flags: 64 });
+        }
+
+        const acc = takeAccount(item.type);
+        if (!acc) return interaction.reply({ content: '❌ Out of stock.', flags: 64 });
+
+        try {
+          await interaction.user.send(`Here is your account:\n\`\`\`${acc}\`\`\``);
+        } catch (e) {
+          // Fallback, technically already checked but if it fails we push back
+          addAccountsToPool(item.type, [acc]);
+          return interaction.reply({ content: '❌ Something went wrong sending your DM. Account was refunded.', flags: 64 });
+        }
+
+        profile.balance -= item.price;
+        economyMap.set(interaction.user.id, profile);
+        saveEconomy();
+        return interaction.reply(`✅ You successfully bought **${item.name}** for **${item.price} coins**! Check your DMs.`);
+      }
+
+      interaction.reply({ content: '❌ Item is not configured correctly.', flags: 64 });
+    },
+  },
+
+  // ══════════════════════════════════════════════════════════
+  //  FIVEM SERVER STATUS
+  // ══════════════════════════════════════════════════════════
+  {
+    data: new SlashCommandBuilder()
+      .setName('serverstatus')
+      .setDescription('Check the FiveM server status'),
+    async execute(interaction) {
+      await interaction.deferReply();
+      const { ip, port } = CONFIG.fivemServer;
+      const baseUrl = `http://${ip}:${port}`;
+
+      try {
+        const infoRes = await axios.get(`${baseUrl}/info.json`, { timeout: 5000 });
+        const playersRes = await axios.get(`${baseUrl}/players.json`, { timeout: 5000 });
+
+        const info = infoRes.data;
+        const players = playersRes.data;
+
+        const embed = new EmbedBuilder()
+          .setColor(0x57F287)
+          .setTitle(`${EMOJI.car} FiveM Server Status`)
+          .setDescription(`**${info.vars?.sv_projectName || 'FiveM Server'}**`)
+          .addFields(
+            { name: 'Status', value: `${EMOJI.check} Online`, inline: true },
+            { name: 'Players', value: `${players.length} / ${info.vars?.sv_maxClients || 'Unknown'}`, inline: true },
+            { name: 'Connect', value: `\`connect ${ip}:${port}\``, inline: false }
+          )
+          .setFooter({ text: `Game: ${info.server?.name || 'GTA V'}` })
+          .setTimestamp();
+
+        await interaction.editReply({ embeds: [embed] });
+      } catch (e) {
+        await interaction.editReply({
+          embeds: [new EmbedBuilder()
+            .setColor(0xE74C3C)
+            .setTitle(`${EMOJI.car} FiveM Server Status`)
+            .setDescription(`**Status:** ${EMOJI.cross} Offline\n\nCould not connect to the server at \`${ip}:${port}\`.`)
+            .setTimestamp()]
+        });
+      }
+    },
+  },
+
+  // ══════════════════════════════════════════════════════════
+  //  MODERATION
+  // ══════════════════════════════════════════════════════════
+  {
+    data: new SlashCommandBuilder()
+      .setName('warn')
+      .setDescription('Warn a user')
+      .addUserOption(o => o.setName('user').setDescription('User to warn').setRequired(true))
+      .addStringOption(o => o.setName('reason').setDescription('Reason for warning').setRequired(true))
+      .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
+    async execute(interaction) {
+      if (!hasCommandPerm(interaction.member)) return interaction.reply({ content: '❌ No permission.', flags: 64 });
+      const target = interaction.options.getUser('user');
+      const reason = interaction.options.getString('reason');
+
+      if (target.id === interaction.user.id || target.bot) return interaction.reply({ content: '❌ Invalid target.', flags: 64 });
+
+      const warnings = warningsMap.get(target.id) || [];
+      warnings.push({ reason, adminTag: interaction.user.tag, timestamp: new Date().toISOString() });
+      warningsMap.set(target.id, warnings);
+      saveWarnings();
+
+      let actionText = '';
+      if (warnings.length >= CONFIG.moderation.maxWarnings) {
+        const member = await interaction.guild.members.fetch(target.id).catch(() => null);
+        if (member && member.kickable) {
+          try {
+            await member.kick(`Reached ${CONFIG.moderation.maxWarnings} warnings`);
+            actionText = `\n\n🚨 **User was automatically kicked for reaching ${CONFIG.moderation.maxWarnings} warnings.**`;
+            warningsMap.delete(target.id);
+            saveWarnings();
+          } catch (e) {
+            actionText = `\n\n⚠️ Could not kick user automatically.`;
+          }
+        }
+      }
+
+      await interaction.reply({
+        embeds: [new EmbedBuilder().setColor(0xFF9900).setTitle(`${EMOJI.warn} User Warned`)
+          .setDescription(`**${target.tag}** has been warned.\n**Reason:** ${reason}${actionText}`)
+          .setFooter({ text: `Total Warnings: ${warningsMap.has(target.id) ? warningsMap.get(target.id).length : 0}` })],
+      });
+      try { await target.send(`⚠️ You were warned in **${interaction.guild.name}** for: **${reason}**`); } catch {}
+    },
+  },
+
+  {
+    data: new SlashCommandBuilder()
+      .setName('warnings')
+      .setDescription('List warnings for a user')
+      .addUserOption(o => o.setName('user').setDescription('User to check').setRequired(true))
+      .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
+    async execute(interaction) {
+      if (!hasCommandPerm(interaction.member)) return interaction.reply({ content: '❌ No permission.', flags: 64 });
+      const target = interaction.options.getUser('user');
+      const warnings = warningsMap.get(target.id) || [];
+
+      if (!warnings.length) return interaction.reply({ content: `${EMOJI.check} **${target.tag}** has no warnings.`, flags: 64 });
+
+      const desc = warnings.map((w, i) => `**${i + 1}.** ${w.reason}\n> By: ${w.adminTag} • <t:${Math.floor(new Date(w.timestamp).getTime() / 1000)}:R>`).join('\n\n');
+      await interaction.reply({
+        embeds: [new EmbedBuilder().setColor(0xFF9900).setTitle(`${EMOJI.warn} Warnings for ${target.tag}`)
+          .setDescription(desc)],
+      });
+    },
+  },
+
+  {
+    data: new SlashCommandBuilder()
+      .setName('clearwarnings')
+      .setDescription('Clear all warnings for a user')
+      .addUserOption(o => o.setName('user').setDescription('User to clear').setRequired(true))
+      .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
+    async execute(interaction) {
+      if (!hasCommandPerm(interaction.member)) return interaction.reply({ content: '❌ No permission.', flags: 64 });
+      const target = interaction.options.getUser('user');
+      warningsMap.delete(target.id);
+      saveWarnings();
+      await interaction.reply({ content: `${EMOJI.check} Cleared all warnings for **${target.tag}**.`, flags: 64 });
+    },
+  },
+
+  {
+    data: new SlashCommandBuilder()
+      .setName('kick')
+      .setDescription('Kick a member')
+      .addUserOption(o => o.setName('user').setDescription('User to kick').setRequired(true))
+      .addStringOption(o => o.setName('reason').setDescription('Reason for kicking').setRequired(false))
+      .setDefaultMemberPermissions(PermissionFlagsBits.KickMembers),
+    async execute(interaction) {
+      if (!hasCommandPerm(interaction.member)) return interaction.reply({ content: '❌ No permission.', flags: 64 });
+      const target = interaction.options.getUser('user');
+      const reason = interaction.options.getString('reason') || 'No reason provided';
+      const member = await interaction.guild.members.fetch(target.id).catch(() => null);
+      if (!member) return interaction.reply({ content: '❌ Member not found.', flags: 64 });
+      if (!member.kickable) return interaction.reply({ content: '❌ Cannot kick this member.', flags: 64 });
+
+      try { await target.send(`🛑 You were kicked from **${interaction.guild.name}** for: **${reason}**`); } catch {}
+      await member.kick(reason);
+      await interaction.reply({ embeds: [new EmbedBuilder().setColor(0xE74C3C).setTitle(`${EMOJI.hammer} Member Kicked`).setDescription(`**${target.tag}** was kicked.\n**Reason:** ${reason}`)] });
+    },
+  },
+
+  {
+    data: new SlashCommandBuilder()
+      .setName('ban')
+      .setDescription('Ban a member')
+      .addUserOption(o => o.setName('user').setDescription('User to ban').setRequired(true))
+      .addStringOption(o => o.setName('reason').setDescription('Reason for banning').setRequired(false))
+      .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers),
+    async execute(interaction) {
+      if (!hasCommandPerm(interaction.member)) return interaction.reply({ content: '❌ No permission.', flags: 64 });
+      const target = interaction.options.getUser('user');
+      const reason = interaction.options.getString('reason') || 'No reason provided';
+
+      try { await target.send(`🔨 You were banned from **${interaction.guild.name}** for: **${reason}**`); } catch {}
+      await interaction.guild.members.ban(target, { reason }).catch(() => null);
+      await interaction.reply({ embeds: [new EmbedBuilder().setColor(0xE74C3C).setTitle(`${EMOJI.ban} Member Banned`).setDescription(`**${target.tag}** was banned.\n**Reason:** ${reason}`)] });
+    },
+  },
+
+  {
+    data: new SlashCommandBuilder()
+      .setName('purge')
+      .setDescription('Delete a specified number of messages')
+      .addIntegerOption(o => o.setName('amount').setDescription('Number of messages to delete (1-100)').setMinValue(1).setMaxValue(100).setRequired(true))
+      .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
+    async execute(interaction) {
+      if (!hasCommandPerm(interaction.member)) return interaction.reply({ content: '❌ No permission.', flags: 64 });
+      const amount = interaction.options.getInteger('amount');
+      const deleted = await interaction.channel.bulkDelete(amount, true).catch(() => null);
+      if (!deleted) return interaction.reply({ content: '❌ Failed to delete messages. Messages older than 14 days cannot be bulk deleted.', flags: 64 });
+      await interaction.reply({ content: `${EMOJI.trash} Deleted **${deleted.size}** messages.`, flags: 64 });
+      setTimeout(() => interaction.deleteReply().catch(() => {}), 3000);
+    },
+  },
+
+  // ══════════════════════════════════════════════════════════
   //  TICKETS
   // ══════════════════════════════════════════════════════════
   {
@@ -1888,6 +2448,8 @@ loadTickets();
 loadBlacklist();
 loadKeyauthRedemptions();
 loadVerifications();
+loadWarnings();
+loadEconomy();
 
 client.once('clientReady', async () => {
   await initSpotify();
@@ -1912,10 +2474,84 @@ client.once('clientReady', async () => {
 });
 
 // ============================================================
+//  VOICE STATE UPDATE (FOR TEMP CHANNELS)
+// ============================================================
+client.on('voiceStateUpdate', async (oldState, newState) => {
+  const { hubChannelId, categoryId } = CONFIG.tempVoice;
+  if (!hubChannelId) return; // Feature disabled
+
+  // User joined the Hub channel
+  if (newState.channelId === hubChannelId) {
+    try {
+      const parentId = categoryId || newState.channel?.parentId || undefined;
+      const newChannel = await newState.guild.channels.create({
+        name: `${newState.member.user.username}'s Channel`,
+        type: ChannelType.GuildVoice,
+        parent: parentId,
+        permissionOverwrites: [
+          {
+            id: newState.member.user.id,
+            allow: [PermissionFlagsBits.ManageChannels, PermissionFlagsBits.ManageRoles]
+          }
+        ]
+      });
+
+      tempVoiceChannels.set(newChannel.id, newState.member.user.id);
+      await newState.setChannel(newChannel);
+    } catch (e) {
+      console.error('[ERR] Failed to create temp voice channel:', e.message);
+    }
+  }
+
+  // User left a channel
+  if (oldState.channelId && oldState.channelId !== newState.channelId) {
+    if (tempVoiceChannels.has(oldState.channelId)) {
+      const channel = oldState.channel;
+      // If the channel is now empty, delete it
+      if (channel && channel.members.size === 0) {
+        try {
+          await channel.delete('Temp voice channel empty');
+          tempVoiceChannels.delete(oldState.channelId);
+        } catch (e) {
+          console.error('[ERR] Failed to delete temp voice channel:', e.message);
+        }
+      }
+    }
+  }
+});
+
+// ============================================================
 //  MEMBER JOIN/LEAVE LOGGING
 // ============================================================
+const { Welcome, Leave } = require('canvafy');
+const { AttachmentBuilder } = require('discord.js');
+
 client.on('guildMemberAdd', async member => {
-  if (!CONFIG.logChannelId) return;
+  // Alt-account detection
+  if (CONFIG.verification.minAccountAgeDays > 0) {
+    const minMs = CONFIG.verification.minAccountAgeDays * 24 * 60 * 60 * 1000;
+    const accountAgeMs = Date.now() - member.user.createdTimestamp;
+
+    if (accountAgeMs < minMs) {
+      try {
+        await member.send(`You have been automatically kicked from **${member.guild.name}** because your account is too new. Minimum age required: ${CONFIG.verification.minAccountAgeDays} days.`);
+      } catch (e) {}
+
+      await member.kick(`Alt-Account Protection: Account younger than ${CONFIG.verification.minAccountAgeDays} days`);
+
+      await sendLog(member.guild, new EmbedBuilder()
+        .setColor(0xE74C3C)
+        .setTitle('🛡️ Anti-Raid: Alt Account Kicked')
+        .addFields(
+          { name: 'User', value: `${member.user.tag}`, inline: true },
+          { name: 'Age', value: `<t:${Math.floor(member.user.createdTimestamp / 1000)}:R>`, inline: true }
+        )
+      );
+      return; // Stop further processing for this member
+    }
+  }
+
+  if (!CONFIG.logChannelId && !CONFIG.welcome.channelId) return;
   try {
     const embed = new EmbedBuilder()
       .setColor(0x57F287)
@@ -1929,13 +2565,31 @@ client.on('guildMemberAdd', async member => {
       )
       .setTimestamp();
     await sendLog(member.guild, embed);
+
+    if (CONFIG.welcome.channelId) {
+      const welcomeChannel = member.guild.channels.cache.get(CONFIG.welcome.channelId);
+      if (welcomeChannel) {
+        const welcome = await new Welcome()
+          .setAvatar(member.user.displayAvatarURL({ forceStatic: true, extension: 'png' }))
+          .setBackground('image', CONFIG.welcome.backgroundUrl)
+          .setTitle('Welcome')
+          .setDescription(`Welcome to ${member.guild.name}!`)
+          .setBorder('#2a2e35')
+          .setAvatarBorder('#2a2e35')
+          .setOverlayOpacity(0.3)
+          .build();
+
+        const attachment = new AttachmentBuilder(welcome, { name: `welcome-${member.id}.png` });
+        await welcomeChannel.send({ content: `Welcome to the server, ${member}!`, files: [attachment] });
+      }
+    }
   } catch (e) {
     console.error('[ERR] guildMemberAdd:', e.message);
   }
 });
 
 client.on('guildMemberRemove', async member => {
-  if (!CONFIG.logChannelId) return;
+  if (!CONFIG.logChannelId && !CONFIG.welcome.channelId) return;
   try {
     const embed = new EmbedBuilder()
       .setColor(0xE74C3C)
@@ -1949,9 +2603,99 @@ client.on('guildMemberRemove', async member => {
       )
       .setTimestamp();
     await sendLog(member.guild, embed);
+
+    if (CONFIG.welcome.channelId) {
+      const welcomeChannel = member.guild.channels.cache.get(CONFIG.welcome.channelId);
+      if (welcomeChannel) {
+        const leave = await new Leave()
+          .setAvatar(member.user.displayAvatarURL({ forceStatic: true, extension: 'png' }))
+          .setBackground('image', CONFIG.welcome.backgroundUrl)
+          .setTitle('Goodbye')
+          .setDescription(`Sad to see you go!`)
+          .setBorder('#2a2e35')
+          .setAvatarBorder('#2a2e35')
+          .setOverlayOpacity(0.3)
+          .build();
+
+        const attachment = new AttachmentBuilder(leave, { name: `leave-${member.id}.png` });
+        await welcomeChannel.send({ content: `Goodbye, **${member.user.tag}**.`, files: [attachment] });
+      }
+    }
   } catch (e) {
     console.error('[ERR] guildMemberRemove:', e.message);
   }
+});
+
+// ============================================================
+//  EXTENDED LOGGING
+// ============================================================
+client.on('messageUpdate', async (oldMsg, newMsg) => {
+  if (oldMsg.author?.bot || !oldMsg.guild || !CONFIG.logChannelId) return;
+  if (oldMsg.content === newMsg.content) return;
+
+  const embed = new EmbedBuilder()
+    .setColor(0xF1C40F)
+    .setTitle('📝 Message Edited')
+    .setAuthor({ name: oldMsg.author.tag, iconURL: oldMsg.author.displayAvatarURL() })
+    .addFields(
+      { name: 'Channel', value: `${oldMsg.channel}`, inline: true },
+      { name: 'Message', value: `[Jump to Message](${newMsg.url})`, inline: true },
+      { name: 'Before', value: oldMsg.content ? oldMsg.content.slice(0, 1024) : '*None/Attachment*' },
+      { name: 'After', value: newMsg.content ? newMsg.content.slice(0, 1024) : '*None/Attachment*' }
+    )
+    .setTimestamp();
+
+  await sendLog(oldMsg.guild, embed);
+});
+
+client.on('messageDelete', async msg => {
+  if (msg.author?.bot || !msg.guild || !CONFIG.logChannelId) return;
+
+  const embed = new EmbedBuilder()
+    .setColor(0xE74C3C)
+    .setTitle('🗑️ Message Deleted')
+    .setAuthor({ name: msg.author.tag, iconURL: msg.author.displayAvatarURL() })
+    .addFields(
+      { name: 'Channel', value: `${msg.channel}`, inline: true },
+      { name: 'Content', value: msg.content ? msg.content.slice(0, 1024) : '*None/Attachment*' }
+    )
+    .setTimestamp();
+
+  await sendLog(msg.guild, embed);
+});
+
+client.on('roleUpdate', async (oldRole, newRole) => {
+  if (!CONFIG.logChannelId) return;
+
+  if (oldRole.name !== newRole.name || oldRole.color !== newRole.color || oldRole.permissions.bitfield !== newRole.permissions.bitfield) {
+    const embed = new EmbedBuilder()
+      .setColor(0x3498DB)
+      .setTitle('🔧 Role Updated')
+      .setDescription(`Role **${newRole.name}** was updated.`)
+      .setTimestamp();
+
+    await sendLog(newRole.guild, embed);
+  }
+});
+
+client.on('channelCreate', async channel => {
+  if (!channel.guild || !CONFIG.logChannelId) return;
+  const embed = new EmbedBuilder()
+    .setColor(0x2ECC71)
+    .setTitle('📁 Channel Created')
+    .setDescription(`Channel ${channel} (\`${channel.name}\`) was created.`)
+    .setTimestamp();
+  await sendLog(channel.guild, embed);
+});
+
+client.on('channelDelete', async channel => {
+  if (!channel.guild || !CONFIG.logChannelId) return;
+  const embed = new EmbedBuilder()
+    .setColor(0xE74C3C)
+    .setTitle('📁 Channel Deleted')
+    .setDescription(`Channel \`${channel.name}\` was deleted.`)
+    .setTimestamp();
+  await sendLog(channel.guild, embed);
 });
 
 // ============================================================
@@ -2235,6 +2979,13 @@ app.get('/api/check-verification/:code', (req, res) => {
 
 // ── Web Dashboard ─────────────────────────────────────────
 app.get('/api/stats', (req, res) => {
+  const guildList = client.guilds.cache.map(g => ({
+    id: g.id,
+    name: g.name,
+    iconUrl: g.iconURL({ size: 64 }) || null,
+    memberCount: g.memberCount
+  }));
+
   const stats = {
     servers: client.guilds.cache.size,
     users: client.users.cache.size,
@@ -2246,6 +2997,7 @@ app.get('/api/stats', (req, res) => {
     steamAccounts: accountPools.steam.length,
     discordAccounts: accountPools.discord.length,
     fivemAccounts: accountPools.fivem.length,
+    guildList: guildList
   };
   res.json(stats);
 });
@@ -2263,6 +3015,12 @@ app.get('/api/config', (req, res) => {
     oauth2: CONFIG.oauth2,
     allowedLinkRoles: CONFIG.allowedLinkRoles,
     wordFilterExemptRoles: CONFIG.wordFilterExemptRoles,
+    moderation: CONFIG.moderation,
+    economy: CONFIG.economy,
+    fivemServer: CONFIG.fivemServer,
+    welcome: CONFIG.welcome,
+    verification: CONFIG.verification,
+    tempVoice: CONFIG.tempVoice,
   });
 });
 
@@ -2306,241 +3064,211 @@ app.post('/api/blacklist-words/remove', (req, res) => {
 
 // ── FULL INTERACTIVE DASHBOARD (Tickets + Blacklist + Giveaways Live) ───────────────────────
 app.get('/', (req, res) => {
-  const stats = {
-    servers: client.guilds.cache.size,
-    users: client.users.cache.size,
-    giveaways: giveaways.size,
-    activeTickets: activeTickets.size,
-    blacklisted: blacklistMap.size,
-    keyauthRedemptions: keyauthRedemptions.size,
-    uptime: client.uptime || 0,
-    steamAccounts: accountPools.steam.length,
-    discordAccounts: accountPools.discord.length,
-    fivemAccounts: accountPools.fivem.length,
-  };
-
-  // Prepare data for tickets, blacklist, giveaways
-  const activeGiveawaysData = [...giveaways.values()]
-    .filter(g => !g.ended)
-    .map(g => ({
-      id: g.id,
-      prize: g.prize,
-      type: g.type,
-      entrants: g.entrants.size,
-      endsAt: g.endsAt
-    }));
-
-  const activeTicketsData = [...activeTickets.values()].map(t => ({
-    channelId: t.channelId || 'Unknown',
-    user: t.username,
-    opened: t.createdAt
-  }));
-
-  const blacklistData = [...blacklistMap.values()].map(b => ({
-    userId: b.userId,
-    username: b.username,
-    reason: b.reason,
-    addedAt: b.addedAt
-  }));
-
   const html = `
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Susano Bot • Dashboard</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.6.0/css/all.min.css">
+  <script src="https://unpkg.com/react@17/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@17/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/@fluentui/react@8/dist/fluentui-react.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-    body { font-family: 'Inter', system-ui, sans-serif; }
-    .glass { background: rgba(255,255,255,0.06); backdrop-filter: blur(20px); border: 1px solid rgba(255,255,255,0.1); }
-    .card-hover:hover { transform: translateY(-8px); box-shadow: 0 25px 50px -12px rgb(0 0 0 / 0.4); }
-    .nav-link { transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); }
-    .nav-link:hover, .nav-link.active { background: rgba(99, 102, 241, 0.25); color: #c4d0ff; border-left: 4px solid #6366f1; }
-    .stat-value { font-size: 2.75rem; font-weight: 700; background: linear-gradient(90deg, #a5b4fc, #e0e7ff); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+    body { margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f3f2f1; }
+    #root { height: 100vh; display: flex; flex-direction: column; }
+    .header { background: #0078d4; color: white; padding: 16px 32px; display: flex; align-items: center; justify-content: space-between; }
+    .header h1 { margin: 0; font-size: 24px; font-weight: 600; }
+    .content-area { padding: 32px; flex: 1; overflow-y: auto; max-width: 1200px; margin: 0 auto; width: 100%; box-sizing: border-box; }
+    .stat-card { background: white; padding: 20px; border-radius: 4px; box-shadow: 0 1.6px 3.6px 0 rgba(0,0,0,0.132), 0 0.3px 0.9px 0 rgba(0,0,0,0.108); }
+    .stat-title { font-size: 14px; color: #605e5c; margin-bottom: 8px; font-weight: 600; text-transform: uppercase; }
+    .stat-value { font-size: 28px; font-weight: 300; color: #323130; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 32px; }
+    .server-card { display: flex; align-items: center; background: white; padding: 16px; border-radius: 4px; box-shadow: 0 1.6px 3.6px 0 rgba(0,0,0,0.132), 0 0.3px 0.9px 0 rgba(0,0,0,0.108); gap: 16px;}
+    .server-card img { width: 48px; height: 48px; border-radius: 50%; }
+    .server-card .info { flex: 1; }
+    .server-card .name { font-weight: 600; font-size: 16px; color: #323130; }
+    .server-card .members { font-size: 12px; color: #605e5c; }
+    .config-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
   </style>
 </head>
-<body class="bg-gradient-to-br from-[#0a0a14] via-[#111827] to-[#1e2937] text-slate-200 min-h-screen">
-  <div class="flex min-h-screen">
-    <!-- Sidebar -->
-    <div class="w-72 glass border-r border-white/10 h-screen fixed overflow-y-auto">
-      <div class="p-8">
-        <div class="flex items-center gap-4 mb-12">
-          <div class="w-12 h-12 bg-gradient-to-br from-indigo-500 to-violet-600 rounded-3xl flex items-center justify-center text-4xl shadow-xl">🛡️</div>
-          <div>
-            <h1 class="text-3xl font-bold tracking-tighter">Susano Bot</h1>
-            <p class="text-indigo-400 text-sm">Native Menu • Powered</p>
-          </div>
-        </div>
-        <nav class="space-y-2">
-          <a href="#" onclick="switchTab(0)" class="nav-link flex items-center gap-3 px-6 py-4 rounded-2xl font-medium active"><i class="fas fa-tachometer-alt w-6"></i> Overview</a>
-          <a href="#" onclick="switchTab(1)" class="nav-link flex items-center gap-3 px-6 py-4 rounded-2xl font-medium"><i class="fas fa-cogs w-6"></i> General</a>
-          <a href="#" onclick="switchTab(2)" class="nav-link flex items-center gap-3 px-6 py-4 rounded-2xl font-medium"><i class="fas fa-shield-alt w-6"></i> Security</a>
-          <a href="#" onclick="switchTab(3)" class="nav-link flex items-center gap-3 px-6 py-4 rounded-2xl font-medium"><i class="fas fa-ticket w-6"></i> Tickets</a>
-          <a href="#" onclick="switchTab(4)" class="nav-link flex items-center gap-3 px-6 py-4 rounded-2xl font-medium"><i class="fas fa-gift w-6"></i> Giveaways</a>
-          <a href="#" onclick="switchTab(5)" class="nav-link flex items-center gap-3 px-6 py-4 rounded-2xl font-medium"><i class="fas fa-ban w-6"></i> Blacklist</a>
-        </nav>
-      </div>
-    </div>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const {
+      ThemeProvider, initializeIcons, Pivot, PivotItem,
+      TextField, PrimaryButton, Label, Stack, Separator, Spinner, SpinnerSize
+    } = window.FluentUIReact;
 
-    <!-- Main Content -->
-    <div class="flex-1 ml-72">
-      <header class="glass border-b border-white/10 px-10 py-6 flex justify-between items-center sticky top-0 z-50">
-        <h2 class="text-4xl font-semibold tracking-tight" id="pageTitle">Overview</h2>
-        <div class="flex items-center gap-6">
-          <div class="bg-emerald-500/20 text-emerald-400 px-5 py-2 rounded-3xl flex items-center gap-3">
-            <div class="w-3 h-3 bg-emerald-400 rounded-full animate-pulse"></div> ONLINE
-          </div>
-          <span id="lastUpdate" class="text-slate-400"></span>
-        </div>
-      </header>
-
-      <div class="p-10 max-w-7xl mx-auto space-y-12">
-
-        <!-- OVERVIEW -->
-        <div id="tab-0" class="tab-content">
-          <div class="grid grid-cols-2 lg:grid-cols-4 gap-6" id="statsGrid"></div>
-        </div>
-
-        <!-- SECURITY -->
-        <div id="tab-2" class="tab-content hidden">
-          <div class="glass rounded-3xl p-10">
-            <h3 class="text-2xl font-bold mb-8">Security & Protection</h3>
-            <div class="mb-12">
-              <h4 class="font-semibold mb-4">Word Filter</h4>
-              <div class="flex gap-3 mb-6">
-                <input id="newWord" placeholder="Add word or phrase" class="flex-1 bg-white/5 border border-white/10 rounded-2xl px-6 py-5">
-                <button onclick="addBlacklistWord()" class="bg-indigo-600 px-10 rounded-2xl">Add</button>
-              </div>
-              <div id="wordsList" class="grid grid-cols-3 gap-3"></div>
-            </div>
-          </div>
-        </div>
-
-        <!-- TICKETS -->
-        <div id="tab-3" class="tab-content hidden">
-          <div class="glass rounded-3xl p-10">
-            <h3 class="text-2xl font-bold mb-6">Active Tickets (${activeTicketsData.length})</h3>
-            <div class="space-y-4" id="ticketsList">
-              ${activeTicketsData.length ? activeTicketsData.map(t => `
-                <div class="glass p-5 rounded-2xl flex justify-between items-center">
-                  <div>
-                    <strong>${t.user}</strong><br>
-                    <small class="text-slate-400">#${t.channelId}</small>
-                  </div>
-                  <div class="text-right text-sm text-slate-400">
-                    Opened: ${new Date(t.opened).toLocaleDateString()}
-                  </div>
-                </div>
-              `).join('') : '<p class="text-slate-400">No active tickets.</p>'}
-            </div>
-          </div>
-        </div>
-
-        <!-- GIVEAWAYS -->
-        <div id="tab-4" class="tab-content hidden">
-          <div class="glass rounded-3xl p-10">
-            <h3 class="text-2xl font-bold mb-6">Active Giveaways (${activeGiveawaysData.length})</h3>
-            <div class="space-y-4" id="giveawaysList">
-              ${activeGiveawaysData.length ? activeGiveawaysData.map(g => `
-                <div class="glass p-5 rounded-2xl">
-                  <div class="flex justify-between">
-                    <div><strong>${g.prize}</strong> <span class="text-indigo-400">(${g.type})</span></div>
-                    <div class="text-sm text-slate-400">${g.entrants} entrants</div>
-                  </div>
-                  <small class="text-slate-400">Ends: ${new Date(g.endsAt).toLocaleString()}</small>
-                </div>
-              `).join('') : '<p class="text-slate-400">No active giveaways.</p>'}
-            </div>
-          </div>
-        </div>
-
-        <!-- BLACKLIST -->
-        <div id="tab-5" class="tab-content hidden">
-          <div class="glass rounded-3xl p-10">
-            <h3 class="text-2xl font-bold mb-6">Blacklisted Users (${blacklistData.length})</h3>
-            <div class="space-y-4" id="blacklistList">
-              ${blacklistData.length ? blacklistData.map(b => `
-                <div class="glass p-5 rounded-2xl">
-                  <strong>${b.username}</strong><br>
-                  <small class="text-red-400">${b.reason}</small>
-                </div>
-              `).join('') : '<p class="text-slate-400">No blacklisted users.</p>'}
-            </div>
-          </div>
-        </div>
-
-      </div>
-    </div>
-  </div>
-
-  <script>
-    let currentStats = ${JSON.stringify(stats)};
-
-    function renderStats() {
-      const html = \`
-        <div class="glass rounded-3xl p-8 card-hover"><div class="flex justify-between"><div><p class="text-slate-400">Servers</p><p class="stat-value">\${currentStats.servers}</p></div><i class="fas fa-server text-6xl text-indigo-400/30"></i></div></div>
-        <div class="glass rounded-3xl p-8 card-hover"><div class="flex justify-between"><div><p class="text-slate-400">Users</p><p class="stat-value">\${currentStats.users.toLocaleString()}</p></div><i class="fas fa-users text-6xl text-purple-400/30"></i></div></div>
-        <div class="glass rounded-3xl p-8 card-hover"><div class="flex justify-between"><div><p class="text-slate-400">Uptime</p><p class="stat-value">\${formatUptime(currentStats.uptime)}</p></div><i class="fas fa-clock text-6xl text-emerald-400/30"></i></div></div>
-        <div class="glass rounded-3xl p-8 card-hover"><div class="flex justify-between"><div><p class="text-slate-400">Blacklisted</p><p class="stat-value text-red-400">\${currentStats.blacklisted}</p></div><i class="fas fa-ban text-6xl text-red-400/30"></i></div></div>
-      \`;
-      document.getElementById('statsGrid').innerHTML = html;
-    }
+    initializeIcons();
 
     function formatUptime(ms) {
-      const d = Math.floor(ms / 86400000);
-      const h = Math.floor((ms % 86400000) / 3600000);
-      return d ? \`\${d}d \${h}h\` : \`\${h}h\`;
+      if (!ms) return 'Just started';
+      const seconds = Math.floor((ms / 1000) % 60);
+      const minutes = Math.floor((ms / (1000 * 60)) % 60);
+      const hours = Math.floor((ms / (1000 * 60 * 60)) % 24);
+      const days = Math.floor(ms / (1000 * 60 * 60 * 24));
+      if (days > 0) return \`\${days}d \${hours}h \${minutes}m\`;
+      if (hours > 0) return \`\${hours}h \${minutes}m \${seconds}s\`;
+      if (minutes > 0) return \`\${minutes}m \${seconds}s\`;
+      return \`\${seconds}s\`;
     }
 
-    async function refreshStats() {
-      try {
-        const res = await fetch('/api/stats');
-        currentStats = await res.json();
-        renderStats();
-      } catch(e) {}
+    function App() {
+      const [stats, setStats] = React.useState(null);
+      const [config, setConfig] = React.useState(null);
+      const [formValues, setFormValues] = React.useState({});
+      const [saving, setSaving] = React.useState(false);
+
+      React.useEffect(() => {
+        fetchData();
+        const interval = setInterval(fetchData, 15000);
+        return () => clearInterval(interval);
+      }, []);
+
+      const fetchData = async () => {
+        try {
+          const [statsRes, configRes] = await Promise.all([
+            fetch('/api/stats'),
+            fetch('/api/config')
+          ]);
+          const statsData = await statsRes.json();
+          const configData = await configRes.json();
+
+          setStats(statsData);
+          setConfig(configData);
+
+          if (Object.keys(formValues).length === 0) {
+            setFormValues({
+              'fivemServer.ip': configData.fivemServer?.ip || '',
+              'fivemServer.port': configData.fivemServer?.port || '',
+              'fivemServer.statusChannelId': configData.fivemServer?.statusChannelId || '',
+              'moderation.maxWarnings': configData.moderation?.maxWarnings || '',
+              'economy.dailyReward': configData.economy?.dailyReward || '',
+              'verification.roleId': configData.verification?.roleId || '',
+              'verification.minAccountAgeDays': configData.verification?.minAccountAgeDays || '',
+              'tempVoice.hubChannelId': configData.tempVoice?.hubChannelId || '',
+              'tempVoice.categoryId': configData.tempVoice?.categoryId || ''
+            });
+          }
+        } catch (e) {
+          console.error("Failed to fetch data", e);
+        }
+      };
+
+      const handleSave = async (key) => {
+        setSaving(true);
+        try {
+          let value = formValues[key];
+          if (!isNaN(value) && value !== '') value = Number(value);
+
+          await fetch('/api/config/update', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ key, value })
+          });
+        } finally {
+          setSaving(false);
+        }
+      };
+
+      if (!stats || !config) return <div style={{padding: 40}}><Spinner size={SpinnerSize.large} label="Loading Dashboard..." /></div>;
+
+      const configMap = {
+        'fivemServer.ip': 'FiveM IP',
+        'fivemServer.port': 'FiveM Port',
+        'fivemServer.statusChannelId': 'FiveM Status Channel ID',
+        'moderation.maxWarnings': 'Max Warnings (before kick)',
+        'economy.dailyReward': 'Economy: Daily Reward Coins',
+        'verification.roleId': 'Verification Role ID',
+        'verification.minAccountAgeDays': 'Anti-Raid Min Account Age (Days)',
+        'tempVoice.hubChannelId': 'Temp Voice Hub Channel ID',
+        'tempVoice.categoryId': 'Temp Voice Category ID'
+      };
+
+      return (
+        <ThemeProvider>
+          <div className="header">
+            <h1>🛡️ Susano Bot Dashboard</h1>
+            <div style={{fontSize: 14, opacity: 0.9}}>Online &bull; Uptime: {formatUptime(stats.uptime)}</div>
+          </div>
+
+          <div className="content-area">
+            <Pivot aria-label="Dashboard Tabs">
+              <PivotItem headerText="Overview" itemIcon="BarChart4">
+                <div style={{marginTop: 24}}>
+                  <div className="grid">
+                    <div className="stat-card">
+                      <div className="stat-title">Servers</div>
+                      <div className="stat-value">{stats.servers}</div>
+                    </div>
+                    <div className="stat-card">
+                      <div className="stat-title">Users</div>
+                      <div className="stat-value">{stats.users.toLocaleString()}</div>
+                    </div>
+                    <div className="stat-card">
+                      <div className="stat-title">Blacklisted</div>
+                      <div className="stat-value" style={{color: '#d13438'}}>{stats.blacklisted}</div>
+                    </div>
+                    <div className="stat-card">
+                      <div className="stat-title">Active Tickets</div>
+                      <div className="stat-value">{stats.activeTickets}</div>
+                    </div>
+                  </div>
+
+                  <h2 style={{fontSize: 20, fontWeight: 600, marginTop: 40, marginBottom: 20}}>Connected Servers</h2>
+                  <div className="grid">
+                    {stats.guildList && stats.guildList.map(g => (
+                      <div className="server-card" key={g.id}>
+                        <img src={g.iconUrl || 'https://cdn.discordapp.com/embed/avatars/0.png'} alt={g.name} />
+                        <div className="info">
+                          <div className="name">{g.name}</div>
+                          <div className="members">{g.memberCount} members</div>
+                        </div>
+                      </div>
+                    ))}
+                    {(!stats.guildList || stats.guildList.length === 0) && <div>No servers found.</div>}
+                  </div>
+                </div>
+              </PivotItem>
+
+              <PivotItem headerText="Configuration" itemIcon="Settings">
+                <div style={{marginTop: 24}}>
+                  <h2 style={{fontSize: 20, fontWeight: 600, marginBottom: 20}}>Dynamic Configuration</h2>
+                  <p style={{color: '#605e5c', marginBottom: 24}}>Update bot modules in real-time. Settings apply immediately.</p>
+
+                  <div className="config-grid">
+                    {Object.entries(configMap).map(([key, label]) => (
+                      <div key={key} className="stat-card">
+                        <TextField
+                          label={label}
+                          value={formValues[key]}
+                          onChange={(e, v) => setFormValues({...formValues, [key]: v})}
+                          disabled={saving}
+                        />
+                        <PrimaryButton
+                          text="Save"
+                          onClick={() => handleSave(key)}
+                          style={{marginTop: 12}}
+                          disabled={saving}
+                        />
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </PivotItem>
+            </Pivot>
+          </div>
+        </ThemeProvider>
+      );
     }
 
-    function switchTab(n) {
-      document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
-      document.getElementById('tab-' + n).classList.remove('hidden');
-      const titles = ['Overview','General','Security','Tickets','Giveaways','Blacklist','KeyAuth','Accounts'];
-      document.getElementById('pageTitle').textContent = titles[n];
-    }
-
-    // Word Filter functions
-    async function addBlacklistWord() {
-      const word = document.getElementById('newWord').value.trim();
-      if (!word) return;
-      await fetch('/api/blacklist-words/add', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({word})});
-      loadWords();
-      document.getElementById('newWord').value = '';
-    }
-
-    async function loadWords() {
-      const res = await fetch('/api/config');
-      const data = await res.json();
-      const container = document.getElementById('wordsList');
-      container.innerHTML = data.blacklistedWords.map(w => 
-        \`<div class="bg-white/5 px-5 py-4 rounded-2xl flex justify-between"><span>\${w}</span><button onclick="removeWord('\${w}')" class="text-red-400 text-xl">×</button></div>\`
-      ).join('');
-    }
-
-    async function removeWord(word) {
-      await fetch('/api/blacklist-words/remove', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({word})});
-      loadWords();
-    }
-
-    // Init
-    renderStats();
-    loadWords();
-    setInterval(refreshStats, 7000);
-    setInterval(() => document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString(), 10000);
+    ReactDOM.render(<App />, document.getElementById('root'));
   </script>
 </body>
-</html>`;
+</html>
+
+`;
 
   res.send(html);
 });
@@ -2585,9 +3313,111 @@ process.on('uncaughtException', err => {
 });
 
 // ============================================================
+//  VERIFICATION STATE
+// ============================================================
+const activeCaptchas = new Map();
+
+const { ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
+const { Captcha } = require('canvafy');
+
+// ============================================================
 //  INTERACTIONS
 // ============================================================
 client.on('interactionCreate', async interaction => {
+
+  // Verification button
+  if (interaction.isButton() && interaction.customId === 'start_verification') {
+    if (!CONFIG.verification.roleId) return interaction.reply({ content: '❌ Verification system is not fully configured.', flags: 64 });
+    if (interaction.member.roles.cache.has(CONFIG.verification.roleId)) return interaction.reply({ content: '✅ You are already verified.', flags: 64 });
+
+    await interaction.deferReply({ flags: 64 });
+
+    const captchaText = Math.random().toString(36).substring(2, 8).toUpperCase();
+    activeCaptchas.set(interaction.user.id, captchaText);
+
+    try {
+      const captchaImage = await new Captcha()
+        .setBackground('image', 'https://i.imgur.com/4mXtF9Z.png')
+        .setCaptchaKey(captchaText)
+        .setBorder('#2a2e35')
+        .setOverlayOpacity(0.5)
+        .build();
+
+      const attachment = new AttachmentBuilder(captchaImage, { name: 'captcha.png' });
+
+      const modalButton = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('submit_captcha').setLabel('Submit Answer').setStyle(ButtonStyle.Primary)
+      );
+
+      await interaction.editReply({
+        content: 'Please solve the Captcha below to verify. Click the button to enter your answer.',
+        files: [attachment],
+        components: [modalButton]
+      });
+
+      // Auto-expire captcha after 3 minutes
+      setTimeout(() => {
+        if (activeCaptchas.has(interaction.user.id) && activeCaptchas.get(interaction.user.id) === captchaText) {
+          activeCaptchas.delete(interaction.user.id);
+        }
+      }, 3 * 60 * 1000);
+    } catch (e) {
+      console.error('[ERR] Captcha generation failed:', e);
+      return interaction.editReply({ content: '❌ An error occurred while generating the Captcha.' });
+    }
+    return;
+  }
+
+  // Captcha modal open
+  if (interaction.isButton() && interaction.customId === 'submit_captcha') {
+    if (!activeCaptchas.has(interaction.user.id)) {
+      return interaction.reply({ content: '❌ Your Captcha has expired. Please click "Verify" again.', flags: 64 });
+    }
+
+    const modal = new ModalBuilder()
+      .setCustomId('captcha_modal')
+      .setTitle('Captcha Verification');
+
+    const textInput = new TextInputBuilder()
+      .setCustomId('captcha_input')
+      .setLabel('Enter the text from the image')
+      .setStyle(TextInputStyle.Short)
+      .setRequired(true)
+      .setMaxLength(6)
+      .setMinLength(6);
+
+    const actionRow = new ActionRowBuilder().addComponents(textInput);
+    modal.addComponents(actionRow);
+
+    await interaction.showModal(modal);
+    return;
+  }
+
+  // Captcha modal submit
+  if (interaction.isModalSubmit() && interaction.customId === 'captcha_modal') {
+    const expected = activeCaptchas.get(interaction.user.id);
+    const provided = interaction.fields.getTextInputValue('captcha_input').toUpperCase();
+
+    if (!expected) {
+      return interaction.reply({ content: '❌ Your Captcha session expired. Try again.', flags: 64 });
+    }
+
+    if (expected !== provided) {
+      activeCaptchas.delete(interaction.user.id);
+      return interaction.reply({ content: '❌ Incorrect Captcha. Please click "Verify" to get a new one.', flags: 64 });
+    }
+
+    // Correct answer
+    activeCaptchas.delete(interaction.user.id);
+    try {
+      await interaction.member.roles.add(CONFIG.verification.roleId, 'Passed Captcha Verification');
+      await interaction.reply({ content: '✅ You have been verified successfully!', flags: 64 });
+    } catch (e) {
+      console.error('[ERR] Failed to assign verification role:', e);
+      await interaction.reply({ content: '❌ I could not assign the verified role. Check my permissions.', flags: 64 });
+    }
+    return;
+  }
 
   // Giveaway button
   if (interaction.isButton() && interaction.customId.startsWith('giveaway_enter:')) {
@@ -2633,13 +3463,34 @@ client.on('interactionCreate', async interaction => {
 });
 
 // ============================================================
-//  MESSAGE GUARD
+//  MESSAGE GUARD & XP SYSTEM
 // ============================================================
 client.on('messageCreate', async message => {
   if (message.author.bot || !message.guild) return;
   const member = message.member;
   if (!member) return;
   const content = message.content;
+
+  // ── XP System ───────────────────────────────────────────────
+  const profile = economyMap.get(message.author.id) || { balance: 0, xp: 0, level: 0, lastXp: 0, lastDaily: 0 };
+  const now = Date.now();
+  if (now - profile.lastXp > CONFIG.economy.xpCooldownMs) {
+    const { min, max } = CONFIG.economy.xpPerMessage;
+    const xpEarned = Math.floor(Math.random() * (max - min + 1)) + min;
+    profile.xp += xpEarned;
+    profile.lastXp = now;
+
+    const nextLevelXp = (profile.level + 1) * 100;
+    if (profile.xp >= nextLevelXp) {
+      profile.xp -= nextLevelXp;
+      profile.level += 1;
+      try {
+        await message.channel.send(`${EMOJI.tada} Congratulations ${message.author}, you leveled up to **Level ${profile.level}**!`);
+      } catch (e) {}
+    }
+    economyMap.set(message.author.id, profile);
+    saveEconomy(); // Consider debouncing in a production env
+  }
 
   // Word filter
   if (!hasWordFilterExempt(member) && CONFIG.blacklistedWords.length) {
@@ -2670,6 +3521,28 @@ client.on('messageCreate', async message => {
     try { await member.timeout(CONFIG.timeoutDurationMinutes * 60_000, 'Unauthorised link'); timedOut = true; } catch {}
     try { await message.author.send(`⚠️ Links not allowed in **${message.guild.name}**.${timedOut ? ` Timed out for ${CONFIG.timeoutDurationMinutes} min.` : ''}`); } catch {}
     await sendLog(message.guild, new EmbedBuilder().setTitle('🔗 Unauthorised Link').setColor(0xE67E22).addFields({ name: '👤 User', value: `${message.author} (${message.author.tag})`, inline: true }, { name: '📌 Channel', value: `${message.channel}`, inline: true }, { name: 'Message', value: content.slice(0, 1024) }, { name: '⏱️ Timeout', value: timedOut ? `${CONFIG.timeoutDurationMinutes} min` : 'No', inline: true }).setTimestamp().setFooter({ text: 'Link Guard' }));
+    return;
+  }
+
+  // Auto-Moderation: Spam / Toxicity detection
+  if (!hasWordFilterExempt(member)) {
+    // Check for excessive caps (if message is > 10 chars and > 70% caps)
+    const letters = content.replace(/[^a-zA-Z]/g, '');
+    if (letters.length > 10) {
+      const upperCount = (letters.match(/[A-Z]/g) || []).length;
+      if (upperCount / letters.length > 0.7) {
+        try { await message.delete(); } catch {}
+        try { await message.author.send(`⚠️ Please turn off CAPS LOCK in **${message.guild.name}**.`); } catch {}
+        return;
+      }
+    }
+
+    // Check for massive repeated characters (spam)
+    if (/(.)\1{9,}/.test(content)) {
+      try { await message.delete(); } catch {}
+      try { await message.author.send(`⚠️ Please do not spam repeated characters in **${message.guild.name}**.`); } catch {}
+      return;
+    }
   }
 });
 
